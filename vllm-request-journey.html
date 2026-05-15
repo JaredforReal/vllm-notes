@@ -1,0 +1,1516 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>vLLM Request 全生命周期</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+:root {
+  --bg-primary: #0d1117;
+  --bg-secondary: #161b22;
+  --bg-tertiary: #21262d;
+  --border: #30363d;
+  --text-primary: #e6edf3;
+  --text-secondary: #8b949e;
+  --text-muted: #6e7681;
+  --accent-api: #58a6ff;
+  --accent-engine: #3fb950;
+  --accent-worker: #f0883e;
+  --accent-ipc: #d29922;
+  --accent-purple: #bc8cff;
+  --accent-red: #f85149;
+  --accent-cyan: #39d2c0;
+  --font-sans: 'Inter', -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+
+body {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  line-height: 1.6;
+  overflow-x: hidden;
+}
+
+/* ─── Navigation ─── */
+.nav {
+  position: fixed;
+  top: 0; left: 0;
+  width: 260px;
+  height: 100vh;
+  background: var(--bg-secondary);
+  border-right: 1px solid var(--border);
+  padding: 24px 0;
+  overflow-y: auto;
+  z-index: 100;
+  transition: transform 0.3s ease;
+}
+.nav-logo {
+  padding: 0 20px 20px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 12px;
+}
+.nav-logo h2 {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: 0.5px;
+}
+.nav-logo span {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.nav a {
+  display: block;
+  padding: 7px 20px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  text-decoration: none;
+  transition: all 0.15s;
+  border-left: 2px solid transparent;
+}
+.nav a:hover {
+  color: var(--text-primary);
+  background: rgba(255,255,255,0.04);
+}
+.nav a.active {
+  color: var(--accent-api);
+  border-left-color: var(--accent-api);
+  background: rgba(88,166,255,0.06);
+}
+.nav .nav-group {
+  padding: 6px 20px 4px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-muted);
+  margin-top: 8px;
+}
+.nav .badge {
+  display: inline-block;
+  width: 18px; height: 18px;
+  border-radius: 4px;
+  text-align: center;
+  line-height: 18px;
+  font-size: 10px;
+  font-weight: 600;
+  margin-right: 6px;
+  vertical-align: middle;
+}
+.badge-api { background: rgba(88,166,255,0.15); color: var(--accent-api); }
+.badge-engine { background: rgba(63,185,80,0.15); color: var(--accent-engine); }
+.badge-worker { background: rgba(240,136,62,0.15); color: var(--accent-worker); }
+.badge-return { background: rgba(188,140,255,0.15); color: var(--accent-purple); }
+.badge-cross { background: rgba(210,153,34,0.15); color: var(--accent-ipc); }
+
+/* ─── Main Content ─── */
+.main {
+  margin-left: 260px;
+  min-height: 100vh;
+}
+
+.section {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 60px 40px 80px;
+  border-bottom: 1px solid var(--border);
+}
+.section:last-child { border-bottom: none; }
+
+.section-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 2px;
+  margin-bottom: 8px;
+}
+.section-title {
+  font-size: 32px;
+  font-weight: 700;
+  margin-bottom: 32px;
+  line-height: 1.2;
+}
+
+/* ─── Title Section ─── */
+.hero {
+  padding: 120px 40px 80px;
+  text-align: center;
+  border-bottom: 1px solid var(--border);
+}
+.hero-title {
+  font-size: 48px;
+  font-weight: 700;
+  line-height: 1.15;
+  margin-bottom: 16px;
+  background: linear-gradient(135deg, var(--accent-api), var(--accent-engine), var(--accent-worker));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+.hero-sub {
+  font-size: 18px;
+  color: var(--text-secondary);
+  font-weight: 300;
+}
+.hero-tags {
+  margin-top: 32px;
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+.hero-tag {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+}
+.hero-tag i { font-style: normal; }
+
+/* ─── Diagram Containers ─── */
+.diagram-box {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 32px;
+  margin: 24px 0;
+  overflow-x: auto;
+}
+.diagram-box.mermaid-container {
+  padding: 24px;
+}
+.diagram-caption {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 16px;
+  font-style: italic;
+}
+.diagram-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 16px;
+}
+
+/* ─── Call Stack Tree ─── */
+.callstack {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 2;
+  color: var(--text-secondary);
+  white-space: pre;
+  overflow-x: auto;
+  padding: 8px 0;
+}
+.callstack .fn-api { color: var(--accent-api); font-weight: 500; }
+.callstack .fn-engine { color: var(--accent-engine); font-weight: 500; }
+.callstack .fn-worker { color: var(--accent-worker); font-weight: 500; }
+.callstack .fn-render { color: #79c0ff; font-weight: 500; }
+.callstack .fn-mm { color: var(--accent-purple); font-weight: 500; }
+.callstack .fn-sampler { color: var(--accent-cyan); font-weight: 500; }
+.callstack .fn-output { color: var(--accent-purple); font-weight: 500; }
+.callstack .comment { color: var(--text-muted); }
+.callstack .highlight { background: rgba(88,166,255,0.08); display: inline; }
+
+/* ─── Pipeline Diagram ─── */
+.pipeline {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  align-items: center;
+}
+.process-box {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 24px;
+  position: relative;
+}
+.process-box.api-process { border-color: rgba(88,166,255,0.3); }
+.process-box.engine-process { border-color: rgba(63,185,80,0.3); }
+.process-box.worker-process { border-color: rgba(240,136,62,0.3); }
+.process-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  margin-bottom: 16px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  display: inline-block;
+}
+.api-process .process-label { background: rgba(88,166,255,0.12); color: var(--accent-api); }
+.engine-process .process-label { background: rgba(63,185,80,0.12); color: var(--accent-engine); }
+.worker-process .process-label { background: rgba(240,136,62,0.12); color: var(--accent-worker); }
+
+.stages-row {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+.stage-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.stage-chip .num {
+  width: 24px; height: 24px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+}
+.api-process .stage-chip { background: rgba(88,166,255,0.08); color: var(--accent-api); }
+.api-process .stage-chip .num { background: rgba(88,166,255,0.2); }
+.engine-process .stage-chip { background: rgba(63,185,80,0.08); color: var(--accent-engine); }
+.engine-process .stage-chip .num { background: rgba(63,185,80,0.2); }
+.worker-process .stage-chip { background: rgba(240,136,62,0.08); color: var(--accent-worker); }
+.worker-process .stage-chip .num { background: rgba(240,136,62,0.2); }
+
+.arrow-down {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 8px 0;
+  color: var(--accent-ipc);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 1px;
+}
+.arrow-down .arrow { font-size: 20px; line-height: 1; }
+
+/* ─── Layer Diagram ─── */
+.layer-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-width: 700px;
+  margin: 0 auto;
+}
+.layer {
+  padding: 16px 20px;
+  border-radius: 8px;
+  font-size: 14px;
+  position: relative;
+}
+.layer-name {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: 13px;
+}
+.layer-desc {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+.layer-contains {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-top: 4px;
+  font-family: var(--font-mono);
+}
+
+/* ─── File Reference ─── */
+.file-ref {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 12px 16px;
+  background: rgba(255,255,255,0.02);
+  border-radius: 6px;
+  margin-top: 16px;
+  border: 1px solid rgba(48,54,61,0.5);
+}
+.file-ref .path { color: var(--accent-api); }
+.file-ref .line { color: var(--text-muted); }
+
+/* ─── Table ─── */
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  margin: 16px 0;
+}
+.data-table th {
+  text-align: left;
+  padding: 10px 12px;
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-tertiary);
+}
+.data-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(48,54,61,0.5);
+  vertical-align: top;
+}
+.data-table tr:hover td {
+  background: rgba(255,255,255,0.02);
+}
+.data-table code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--accent-api);
+}
+
+/* ─── Flow Steps ─── */
+.flow-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.flow-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 10px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  background: rgba(255,255,255,0.02);
+}
+.flow-step .step-num {
+  min-width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.flow-step .step-content {
+  flex: 1;
+}
+.flow-step .step-title {
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+.flow-step .step-desc {
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+}
+
+/* ─── Mermaid Overrides ─── */
+.mermaid {
+  display: flex;
+  justify-content: center;
+}
+.mermaid svg {
+  max-width: 100%;
+}
+
+/* ─── Responsive ─── */
+@media (max-width: 900px) {
+  .nav { transform: translateX(-100%); }
+  .nav.open { transform: translateX(0); }
+  .main { margin-left: 0; }
+  .hero-title { font-size: 32px; }
+  .section-title { font-size: 24px; }
+  .section { padding: 40px 20px 60px; }
+  .menu-toggle { display: flex !important; }
+}
+
+.menu-toggle {
+  display: none;
+  position: fixed;
+  top: 12px; left: 12px;
+  z-index: 200;
+  width: 40px; height: 40px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--text-primary);
+  font-size: 18px;
+}
+
+/* ─── Iteration Loop Badge ─── */
+.loop-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+  background: rgba(210,153,34,0.1);
+  color: var(--accent-ipc);
+  border: 1px solid rgba(210,153,34,0.2);
+  margin: 16px 0;
+}
+
+/* ─── Two Column Layout ─── */
+.two-col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
+  margin: 24px 0;
+}
+@media (max-width: 768px) {
+  .two-col { grid-template-columns: 1fr; }
+}
+
+/* ─── Color Legend ─── */
+.legend {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin: 16px 0;
+}
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.legend-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+}
+</style>
+</head>
+<body>
+
+<!-- Mobile Menu Toggle -->
+<div class="menu-toggle" onclick="document.querySelector('.nav').classList.toggle('open')">&#9776;</div>
+
+<!-- Navigation -->
+<nav class="nav">
+  <div class="nav-logo">
+    <h2>vLLM Request Journey</h2>
+    <span>Hands-on Walkthrough Slides</span>
+  </div>
+  <a href="#overview" class="active">全局概览</a>
+  <div class="nav-group">API Server 进程</div>
+  <a href="#stage1"><span class="badge badge-api">1</span>API 接收与解析</a>
+  <a href="#stage2-3"><span class="badge badge-api">2-3</span>渲染分词 / 多模态</a>
+  <a href="#stage4"><span class="badge badge-api">4</span>提交到引擎</a>
+  <div class="nav-group">Engine Core 进程</div>
+  <a href="#stage5"><span class="badge badge-engine">5</span>调度排队</a>
+  <div class="nav-group">GPU Worker 进程</div>
+  <a href="#stage6-8"><span class="badge badge-worker">6-8</span>GPU 执行</a>
+  <div class="nav-group">状态更新 &amp; 返回</div>
+  <a href="#stage9"><span class="badge badge-engine">9</span>调度器更新</a>
+  <a href="#stage10-11"><span class="badge badge-return">10-11</span>输出处理 &amp; 流式返回</a>
+  <div class="nav-group">附录</div>
+  <a href="#crosscut"><span class="badge badge-cross">&#times;</span>横切关注点</a>
+  <a href="#dataflow">数据对象流转</a>
+  <a href="#fullseq">完整时序图</a>
+</nav>
+
+<!-- Main Content -->
+<div class="main">
+
+<!-- ═══════ HERO ═══════ -->
+<section class="hero" id="top">
+  <div class="hero-title">vLLM Request 全生命周期</div>
+  <div class="hero-sub">从 HTTP 请求到达 API Server，到最终输出返回给用户的完整旅程</div>
+  <div class="hero-tags">
+    <span class="hero-tag" style="background:rgba(88,166,255,0.1);color:var(--accent-api)">
+      <i style="font-size:18px">&#9672;</i> API Server
+    </span>
+    <span class="hero-tag" style="background:rgba(63,185,80,0.1);color:var(--accent-engine)">
+      <i style="font-size:18px">&#9672;</i> Engine Core
+    </span>
+    <span class="hero-tag" style="background:rgba(240,136,62,0.1);color:var(--accent-worker)">
+      <i style="font-size:18px">&#9672;</i> GPU Worker
+    </span>
+    <span class="hero-tag" style="background:rgba(210,153,34,0.1);color:var(--accent-ipc)">
+      <i style="font-size:18px">&#9646;</i> ZMQ IPC
+    </span>
+  </div>
+  <div style="margin-top:40px; font-size:13px; color:var(--text-muted)">
+    核对基准：vLLM releases/v0.20.0 &nbsp;|&nbsp; 3 个进程 &nbsp;|&nbsp; 11 个阶段 &nbsp;|&nbsp; 3 个并发循环
+  </div>
+</section>
+
+<!-- ═══════ OVERVIEW ═══════ -->
+<section class="section" id="overview">
+  <div class="section-label" style="color:var(--text-muted)">Architecture Overview</div>
+  <div class="section-title">全局概览</div>
+
+  <div class="pipeline">
+    <!-- API Server -->
+    <div class="process-box api-process">
+      <div class="process-label">API Server 进程 &nbsp;(FastAPI + Uvicorn)</div>
+      <div class="stages-row">
+        <div class="stage-chip"><span class="num">1</span> API 接收与解析</div>
+        <div class="stage-chip"><span class="num">2</span> 渲染与分词</div>
+        <div class="stage-chip"><span class="num">3</span> 多模态处理</div>
+        <div class="stage-chip"><span class="num">4</span> 提交到引擎</div>
+      </div>
+    </div>
+
+    <div class="arrow-down"><span class="arrow">&#8595;</span>ZMQ IPC (ROUTER &#8594; DEALER)</div>
+
+    <!-- Engine Core -->
+    <div class="process-box engine-process">
+      <div class="process-label">Engine Core 进程</div>
+      <div class="stages-row">
+        <div class="stage-chip"><span class="num">5</span> 调度排队</div>
+        <div class="stage-chip"><span class="num">9</span> 调度器更新状态</div>
+      </div>
+    </div>
+
+    <div class="arrow-down"><span class="arrow">&#8595;</span>内部调用 (model_executor)</div>
+
+    <!-- GPU Worker -->
+    <div class="process-box worker-process">
+      <div class="process-label">GPU Worker 进程</div>
+      <div class="stages-row">
+        <div class="stage-chip"><span class="num">6</span> Worker 输入准备</div>
+        <div class="stage-chip"><span class="num">7</span> 模型前向推理</div>
+        <div class="stage-chip"><span class="num">8</span> 采样</div>
+      </div>
+    </div>
+
+    <div class="arrow-down"><span class="arrow">&#8595;</span>ZMQ IPC (PUSH &#8594; PULL)</div>
+
+    <!-- API Server Return -->
+    <div class="process-box api-process">
+      <div class="process-label">API Server 进程 &nbsp;(output handler)</div>
+      <div class="stages-row">
+        <div class="stage-chip"><span class="num">10</span> 输出处理与反分词</div>
+        <div class="stage-chip"><span class="num">11</span> 流式返回</div>
+      </div>
+    </div>
+  </div>
+
+  <div style="display:flex; justify-content:center; margin-top:20px;">
+    <div class="loop-badge">&#8635; Stage 5-9 在每个 iteration 中重复执行，每步生成一个或多个 token，直到请求完成</div>
+  </div>
+
+  <div class="file-ref">阅读路径：先看总图建立进程边界 &rarr; Stage 1-4 理解请求解析 &rarr; Stage 5-11 理解迭代执行与返回</div>
+</section>
+
+<!-- ═══════ STAGE 1 ═══════ -->
+<section class="section" id="stage1">
+  <div class="section-label" style="color:var(--accent-api)">Stage 1</div>
+  <div class="section-title">API 接收与解析</div>
+
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:var(--accent-api)"></div> API Server</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--accent-engine)"></div> AsyncLLM</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#79c0ff"></div> Renderer</div>
+  </div>
+
+  <div class="diagram-box mermaid-container">
+    <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant R as API Router
+    participant S as ServingChat
+    participant Ren as Renderer
+    participant A as AsyncLLM
+
+    C->>R: POST /v1/chat/completions
+    R->>S: create_chat_completion()
+    Note over S: 校验 model / request params
+    S->>Ren: render_chat_request()
+    Note over Ren: render_messages()<br/>tokenize_prompts()<br/>process MM inputs
+    Ren-->>S: prompt_token_ids / mm_data
+    Note over S: to_sampling_params()
+    S->>A: engine_client.generate()
+    Note over A: 返回 async generator
+    A-->>S: AsyncGenerator[RequestOutput]
+    S-->>R: StreamingResponse / JSON
+    R-->>C: SSE / JSON Response
+    </pre>
+  </div>
+
+  <div class="two-col">
+    <div>
+      <div class="diagram-title">请求对象</div>
+      <div class="callstack"><span class="fn-api">ChatCompletionRequest</span> &nbsp;(Pydantic model)
+  model, messages, temperature, max_tokens
+  stop, stop_token_ids, logprobs
+  response_format (结构化输出)
+  <span class="comment">image_url, audio_url, video_url (多模态)</span></div>
+    </div>
+    <div>
+      <div class="diagram-title">调用栈</div>
+      <div class="callstack"><span class="fn-api">run_server()</span>
+  <span class="comment">└──</span> <span class="fn-api">run_server_worker()</span>
+        <span class="comment">├──</span> <span class="fn-api">build_async_engine_client()</span> → AsyncLLM
+        <span class="comment">├──</span> <span class="fn-api">build_app()</span> → FastAPI routes
+        <span class="comment">└──</span> uvicorn.run()</div>
+    </div>
+  </div>
+
+  <div class="file-ref">
+    <span class="path">entrypoints/openai/api_server.py</span> &rarr;
+    <span class="path">chat_completion/api_router.py</span> &rarr;
+    <span class="path">chat_completion/serving.py</span>:229
+  </div>
+</section>
+
+<!-- ═══════ STAGE 2-3 ═══════ -->
+<section class="section" id="stage2-3">
+  <div class="section-label" style="color:var(--accent-api)">Stage 2-3</div>
+  <div class="section-title">渲染、分词与多模态处理</div>
+
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:var(--accent-api)"></div> Serving</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#79c0ff"></div> Renderer</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--accent-purple)"></div> MultiModal</div>
+  </div>
+
+  <div class="diagram-title">Chat Request 渲染调用栈</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-api">OpenAIServingChat.create_chat_completion()</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> tokenizer / reasoning_parser 初始化
+  <span class="comment">│</span>
+  <span class="comment">├─</span> <span class="fn-api">render_chat_request(request)</span>
+  <span class="comment">│  ├─</span> <span class="fn-api">_check_model(request)</span>
+  <span class="comment">│  └─</span> <span class="fn-render">openai_serving_render.render_chat(request)</span>
+  <span class="comment">│     ├─</span> validate_chat_template(...)
+  <span class="comment">│     └─</span> <span class="fn-render">preprocess_chat(...)</span>
+  <span class="comment">│        ├─</span> 构造 ChatParams
+  <span class="comment">│        └─</span> <span class="fn-render">renderer.render_chat_async(...)</span>
+  <span class="comment">│           │</span>
+  <span class="comment">│           ├─</span> <span style="color:#79c0ff;font-weight:600">HfRenderer.render_messages_async()</span>
+  <span class="comment">│           │  ├─</span> parse_chat_messages_async()
+  <span class="comment">│           │  │  <span class="comment">├─ 规范化 OpenAI message content</span>
+  <span class="comment">│           │  │  <span class="comment">├─ 下载/读取 image/audio/video parts</span>
+  <span class="comment">│           │  │  <span class="comment">├─ 输出 conversation</span>
+  <span class="comment">│           │  │  <span class="comment">├─ 输出 mm_data: MultiModalDataDict</span>
+  <span class="comment">│           │  │  <span class="comment">└─ 输出 mm_uuids</span>
+  <span class="comment">│           │  ├─</span> <span class="fn-render">safe_apply_chat_template()</span>
+  <span class="comment">│           │  └─</span> prompt dict (prompt + mm_data)
+  <span class="comment">│           │</span>
+  <span class="comment">│           ├─</span> <span style="color:#7ee787;font-weight:600">BaseRenderer.tokenize_prompts()</span>
+  <span class="comment">│           │  └─</span> tokenizer.encode()
+  <span class="comment">│           │</span>
+  <span class="comment">│           └─</span> <span style="color:#7ee787;font-weight:600">BaseRenderer.process_for_engine_async()</span>
+  <span class="comment">│              ├─</span> 无 MM: <span class="fn-render">tokens_input(prompt_token_ids)</span>
+  <span class="comment">│              └─</span> 有 MM: <span class="fn-mm">_process_multimodal_async()</span>
+  <span class="comment">│                 ├─</span> <span class="fn-mm">mm_processor.info.parse_mm_data()</span>
+  <span class="comment">│                 ├─</span> <span class="fn-mm">BaseMultiModalProcessor.apply()</span>
+  <span class="comment">│                 │  ├─</span> _cached_apply_hf_processor()
+  <span class="comment">│                 │  │  └─</span> <span class="fn-mm">_call_hf_processor()</span>
+  <span class="comment">│                 │  │     └─ HF ProcessorMixin (text+media → tensors)
+  <span class="comment">│                 │  ├─</span> _maybe_apply_prompt_updates()
+  <span class="comment">│                 │  └─</span> mm_input(...)
+  <span class="comment">│                 └─</span> MultiModalInput
+  <span class="comment">│</span>
+  <span class="comment">├─</span> 得到 conversation, engine_inputs
+  <span class="comment">├─</span> request.to_sampling_params()
+  <span class="comment">└─</span> <span class="fn-api">engine_client.generate(...)</span></div>
+  </div>
+
+  <div class="two-col">
+    <div>
+      <div class="diagram-title">Renderer 四步主流程</div>
+      <div class="flow-steps">
+        <div class="flow-step">
+          <div class="step-num" style="background:rgba(88,166,255,0.15);color:var(--accent-api)">1</div>
+          <div class="step-content">
+            <div class="step-title">render_messages()</div>
+            <div class="step-desc">Jinja chat template → 文本</div>
+          </div>
+        </div>
+        <div class="flow-step">
+          <div class="step-num" style="background:rgba(88,166,255,0.15);color:var(--accent-api)">2</div>
+          <div class="step-content">
+            <div class="step-title">tokenize_prompts()</div>
+            <div class="step-desc">文本 → token IDs</div>
+          </div>
+        </div>
+        <div class="flow-step">
+          <div class="step-num" style="background:rgba(88,166,255,0.15);color:var(--accent-api)">3</div>
+          <div class="step-content">
+            <div class="step-title">_apply_prompt_extras()</div>
+            <div class="step-desc">cache_salt 等附加字段</div>
+          </div>
+        </div>
+        <div class="flow-step">
+          <div class="step-num" style="background:rgba(88,166,255,0.15);color:var(--accent-api)">4</div>
+          <div class="step-content">
+            <div class="step-title">process_for_engine()</div>
+            <div class="step-desc">多模态处理 → EngineInput</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div>
+      <div class="diagram-title">vLLM vs HF Processor 分工</div>
+      <div class="diagram-box" style="padding:16px">
+        <div style="font-size:13px;margin-bottom:8px;color:var(--accent-purple);font-weight:600">vLLM BaseMultiModalProcessor</div>
+        <div style="font-size:12px;color:var(--text-secondary);line-height:1.8;padding-left:12px">
+          解析 MultiModalDataItems<br>
+          处理 processor cache<br>
+          计算 mm_hashes<br>
+          定义 prompt updates / placeholder 规则<br>
+          HF BatchFeature → MultiModalKwargsItems
+        </div>
+        <div style="height:1px;background:var(--border);margin:12px 0"></div>
+        <div style="font-size:13px;margin-bottom:8px;color:var(--accent-worker);font-weight:600">HF ProcessorMixin</div>
+        <div style="font-size:12px;color:var(--text-secondary);line-height:1.8;padding-left:12px">
+          图像 resize / normalize / patch<br>
+          音频 feature extraction<br>
+          视频 frame / vision 前处理<br>
+          text + media 联合 tokenization<br>
+          → BatchFeature (pixel_values, ...)
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="file-ref">
+    <span class="path">renderers/base.py</span>:969 &nbsp;|&nbsp;
+    <span class="path">renderers/hf.py</span>:622 &nbsp;|&nbsp;
+    <span class="path">multimodal/processing/processor.py</span>
+  </div>
+</section>
+
+<!-- ═══════ STAGE 4 ═══════ -->
+<section class="section" id="stage4">
+  <div class="section-label" style="color:var(--accent-api)">Stage 4</div>
+  <div class="section-title">提交到引擎</div>
+
+  <div class="diagram-box mermaid-container">
+    <div class="diagram-title">AsyncLLM 内部架构</div>
+    <pre class="mermaid">
+flowchart TB
+    subgraph api["API Server 进程"]
+        direction TB
+        serving["OpenAI Serving Task"]
+        gen["AsyncLLM.generate()"]
+        add["add_request()"]
+        ip["InputProcessor.process_inputs()"]
+        op["OutputProcessor.add_request()"]
+
+        subgraph bg["后台 task"]
+            oh["_run_output_handler()"]
+            proc["process_outputs()"]
+            det["detokenize + logprobs"]
+            col["collector.put()"]
+        end
+
+        subgraph zmq_out["AsyncMPClient"]
+            zmq_send["ZMQ ROUTER send"]
+            zmq_recv["ZMQ PULL recv"]
+            oq["outputs_queue"]
+        end
+    end
+
+    serving --> gen
+    gen --> add
+    add --> ip
+    add --> op
+    ip --> zmq_send
+    zmq_recv --> oq
+    oq --> oh
+    oh --> proc
+    proc --> det
+    det --> col
+    col -.->|per-request| gen
+
+    style api fill:#161b22,stroke:#30363d,color:#e6edf3
+    style bg fill:#21262d,stroke:#30363d,color:#e6edf3
+    style zmq_out fill:#1c2128,stroke:#30363d,color:#e6edf3
+    </pre>
+  </div>
+
+  <div class="diagram-title">队列 / 缓冲一览</div>
+  <div class="diagram-box" style="padding:0;overflow-x:auto">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>位置</th>
+          <th>队列</th>
+          <th>生产者</th>
+          <th>消费者</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>API 进程</td>
+          <td><code>RequestOutputCollector</code></td>
+          <td>OutputProcessor</td>
+          <td>当前 request 的 generate()</td>
+        </tr>
+        <tr>
+          <td>API 进程</td>
+          <td><code>outputs_queue</code></td>
+          <td>process_outputs_socket()</td>
+          <td>output_handler</td>
+        </tr>
+        <tr>
+          <td>API → Core</td>
+          <td><code>ZMQ ROUTER → DEALER</code></td>
+          <td>AsyncMPClient</td>
+          <td>EngineCoreProc</td>
+        </tr>
+        <tr>
+          <td>Core 进程</td>
+          <td><code>input_queue</code></td>
+          <td>input socket thread</td>
+          <td>run_busy_loop()</td>
+        </tr>
+        <tr>
+          <td>Core 进程</td>
+          <td><code>output_queue</code></td>
+          <td>run_busy_loop()</td>
+          <td>output socket thread</td>
+        </tr>
+        <tr>
+          <td>Core → API</td>
+          <td><code>ZMQ PUSH → PULL</code></td>
+          <td>output socket thread</td>
+          <td>AsyncMPClient</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="diagram-title">三个并发循环</div>
+  <div class="diagram-box">
+    <div class="two-col" style="margin:0">
+      <div>
+        <div style="font-size:13px;font-weight:600;color:var(--accent-api);margin-bottom:8px">1. Per-Request 循环</div>
+        <div style="font-size:12px;color:var(--text-secondary);font-family:var(--font-mono);line-height:1.8">
+          AsyncLLM.generate():<br>
+          q.get_nowait() or await q.get()<br>
+          yield RequestOutput<br>
+          <span style="color:var(--text-muted)">→ 直到 finished=True</span>
+        </div>
+      </div>
+      <div>
+        <div style="font-size:13px;font-weight:600;color:var(--accent-engine);margin-bottom:8px">2. Output Handler 循环</div>
+        <div style="font-size:12px;color:var(--text-secondary);font-family:var(--font-mono);line-height:1.8">
+          _run_output_handler():<br>
+          await get_output_async()<br>
+          process_outputs() → collectors<br>
+          <span style="color:var(--text-muted)">→ 处理所有 request 的 batch 输出</span>
+        </div>
+      </div>
+    </div>
+    <div style="margin-top:16px">
+      <div style="font-size:13px;font-weight:600;color:var(--accent-worker);margin-bottom:8px">3. Engine Core 循环</div>
+      <div style="font-size:12px;color:var(--text-secondary);font-family:var(--font-mono);line-height:1.8">
+        run_busy_loop():<br>
+        _process_input_queue() → _process_engine_step() → output_queue.put()<br>
+        <span style="color:var(--text-muted)">→ 只要 scheduler 有 unfinished requests 就继续 step</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="file-ref">
+    <span class="path">v1/engine/async_llm.py</span>:521 generate &nbsp;|&nbsp;
+    <span class="path">v1/engine/async_llm.py</span>:280 add_request &nbsp;|&nbsp;
+    <span class="path">v1/engine/core_client.py</span>:1058
+  </div>
+</section>
+
+<!-- ═══════ STAGE 5 ═══════ -->
+<section class="section" id="stage5">
+  <div class="section-label" style="color:var(--accent-engine)">Stage 5</div>
+  <div class="section-title">调度排队</div>
+
+  <div class="loop-badge" style="margin-bottom:24px">&#8635; 以下时序图展示的是每个 engine iteration 的完整循环</div>
+
+  <div class="diagram-box mermaid-container">
+    <pre class="mermaid">
+sequenceDiagram
+    participant A as AsyncLLM
+    participant M as AsyncMPClient
+    participant E as EngineCore
+    participant S as Scheduler
+    participant W as GPUWorker
+
+    Note over A,W: ─── 请求提交 ───
+    A->>M: add_request_async()
+    M->>E: ZMQ ROUTER → ADD
+    Note over E: decode + preprocess<br/>grammar_init()
+    E->>S: add_request() → waiting
+
+    Note over A,W: ─── 调度 ───
+    E->>S: schedule()
+    Note right of S: Phase 1: RUNNING<br/>Phase 2: WAITING → RUNNING
+    S-->>E: SchedulerOutput
+
+    Note over A,W: ─── 模型执行 ───
+    E->>W: execute_model(scheduler_output)
+    Note right of W: _update_states()<br/>_prepare_inputs()<br/>model forward
+    W-->>E: hidden_states / logits
+
+    Note over A,W: ─── 采样 ───
+    E->>S: get_grammar_bitmask()
+    E->>W: sample_tokens(grammar_mask)
+    Note right of W: grammar mask<br/>logits processors<br/>sample token ids
+    W-->>E: ModelRunnerOutput
+
+    Note over A,W: ─── 状态更新 ───
+    E->>S: update_from_output()
+    Note right of S: append tokens<br/>check stop<br/>free KV if done
+    S-->>E: EngineCoreOutputs
+    E->>E: output_queue.put()
+    E->>M: ZMQ PUSH
+    M->>A: outputs_queue
+    Note over A: process_outputs()<br/>collector.put()
+    </pre>
+  </div>
+
+  <div class="two-col">
+    <div>
+      <div class="diagram-title">EngineCore 输入处理</div>
+      <div class="callstack"><span class="fn-engine">EngineCoreProc.__init__()</span>
+  <span class="comment">├──</span> input_queue = queue.Queue()
+  <span class="comment">├──</span> output_queue = queue.Queue()
+  <span class="comment">├──</span> 启动 <span class="fn-engine">process_input_sockets()</span> 线程
+  <span class="comment">└──</span> 启动 <span class="fn-engine">process_output_sockets()</span> 线程
+
+<span class="fn-engine">run_busy_loop()</span>
+  <span class="comment">├──</span> _process_input_queue()
+  <span class="comment">│   ├──</span> 空闲时阻塞等待 input_queue
+  <span class="comment">│   └──</span> _handle_client_request()
+  <span class="comment">│       ├──</span> ADD → Scheduler.add_request()
+  <span class="comment">│       ├──</span> ABORT → finish_requests()
+  <span class="comment">│       └──</span> UTILITY → 调 EngineCore 方法
+  <span class="comment">└──</span> _process_engine_step() → step()</div>
+    </div>
+    <div>
+      <div class="diagram-title">Scheduler.schedule() 两阶段</div>
+      <div class="flow-steps">
+        <div class="flow-step">
+          <div class="step-num" style="background:rgba(63,185,80,0.15);color:var(--accent-engine)">P1</div>
+          <div class="step-content">
+            <div class="step-title">调度 RUNNING</div>
+            <div class="step-desc">计算 new tokens → 分配 KV blocks → 内存不足时抢占</div>
+          </div>
+        </div>
+        <div class="flow-step">
+          <div class="step-num" style="background:rgba(63,185,80,0.15);color:var(--accent-engine)">P2</div>
+          <div class="step-content">
+            <div class="step-title">调度 WAITING</div>
+            <div class="step-desc">prefix cache 命中 → 准入控制 → 分配 KV → 移入 running</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="file-ref">
+    <span class="path">v1/engine/core.py</span>:1164 busy_loop &nbsp;|&nbsp;
+    <span class="path">v1/core/sched/scheduler.py</span>:352 schedule
+  </div>
+</section>
+
+<!-- ═══════ STAGE 6-8 ═══════ -->
+<section class="section" id="stage6-8">
+  <div class="section-label" style="color:var(--accent-worker)">Stage 6-8</div>
+  <div class="section-title">GPU 执行：准备 → 推理 → 采样</div>
+
+  <div class="diagram-title">Worker / ModelRunner / Model 三层架构</div>
+  <div class="diagram-box">
+    <div class="layer-stack">
+      <div class="layer" style="background:rgba(240,136,62,0.08);border-left:3px solid var(--accent-worker)">
+        <div class="layer-name" style="color:var(--accent-worker)">Worker</div>
+        <div class="layer-desc">绑定 rank / local_rank，管理 accelerator device，初始化分布式通信和 GPU 内存</div>
+        <div class="layer-contains">持有 model runner</div>
+      </div>
+      <div class="layer" style="background:rgba(188,140,255,0.08);border-left:3px solid var(--accent-purple)">
+        <div class="layer-name" style="color:var(--accent-purple)">ModelRunner</div>
+        <div class="layer-desc">根据 SchedulerOutput 准备 GPU tensors，管理 CUDA Graph / attention metadata / InputBatch</div>
+        <div class="layer-contains">调用 model forward，执行 logits 处理与采样</div>
+      </div>
+      <div class="layer" style="background:rgba(57,210,192,0.08);border-left:3px solid var(--accent-cyan)">
+        <div class="layer-name" style="color:var(--accent-cyan)">Model (torch.nn.Module)</div>
+        <div class="layer-desc">Embedding, Attention (PagedAttention), MLP/MoE, LM Head</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="two-col">
+    <div>
+      <div class="diagram-title">Stage 6: Worker 输入准备</div>
+      <div class="callstack"><span class="fn-worker">execute_model(scheduler_output)</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> <span class="fn-worker">_update_states()</span>
+  <span class="comment">│  ├─</span> 移除 finished 请求的 cached state
+  <span class="comment">│  ├─</span> 释放 encoder cache
+  <span class="comment">│  ├─</span> 写入 new / resumed / running 状态
+  <span class="comment">│  └─</span> 更新 block table, 采样元数据
+  <span class="comment">│</span>
+  <span class="comment">└─</span> <span class="fn-worker">_prepare_inputs()</span>
+     <span class="comment">├─</span> 排序 (decode 在前, prefill 在后)
+     <span class="comment">├─</span> 构建 idx_mapping
+     <span class="comment">├─</span> 计算 query_start_loc (cumsum)
+     <span class="comment">├─</span> [Prefill] Triton kernel 填 input_ids
+     <span class="comment">├─</span> [Decode] 合并上次 token + drafts
+     <span class="comment">└─</span> → InputBatch (GPU tensors 就绪)</div>
+    </div>
+    <div>
+      <div class="diagram-title">Stage 7: 模型前向推理</div>
+      <div class="callstack"><span class="fn-worker">execute_model() 继续</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> [FULL CUDA Graph] → <span class="fn-worker">cudagraph_manager.run_fullgraph()</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> [Eager / PIECEWISE] → <span class="fn-worker">model(**model_inputs)</span>
+  <span class="comment">│  │</span>
+  <span class="comment">│  ├─</span> Embedding lookup
+  <span class="comment">│  ├─</span> [多模态] 注入 vision/audio embeddings
+  <span class="comment">│  │</span>
+  <span class="comment">│  ├─</span> <span style="color:var(--accent-cyan);font-weight:600">N × TransformerLayer:</span>
+  <span class="comment">│  │  ├─</span> RMSNorm
+  <span class="comment">│  │  ├─</span> Self-Attention (PagedAttention)
+  <span class="comment">│  │  ├─</span> RMSNorm
+  <span class="comment">│  │  └─</span> FFN / MoE
+  <span class="comment">│  │</span>
+  <span class="comment">│  └─</span> Final RMSNorm → Linear → logits
+  <span class="comment">│</span>
+  <span class="comment">└─</span> 存储 hidden_states / logits</div>
+    </div>
+  </div>
+
+  <div class="diagram-title" style="margin-top:24px">Stage 8: 采样</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-worker">EngineCore.step() 中:</span>
+  <span class="fn-engine">execute_model()</span> → 暂存 logits（不采样）
+  <span class="fn-engine">get_grammar_bitmask()</span> → 结构化输出 mask
+  <span class="fn-sampler">sample_tokens(grammar_output)</span>
+  <span class="comment">  │</span>
+  <span class="comment">  ├─</span> 从 state 取出 logits
+  <span class="comment">  ├─</span> <span class="fn-sampler">apply_grammar_bitmask()</span> → 不允许 token → -inf
+  <span class="comment">  ├─</span> <span class="fn-sampler">_sample(logits)</span>
+  <span class="comment">  │  └─</span> <span class="fn-sampler">Sampler.forward()</span>
+  <span class="comment">  │     ├─</span> logit_bias / allowed_token_ids
+  <span class="comment">  │     ├─</span> frequency / presence / repetition penalty
+  <span class="comment">  │     ├─</span> temperature 缩放
+  <span class="comment">  │     ├─</span> min-p / top-k / top-p 过滤
+  <span class="comment">  │     └─</span> top-k/top-p sampler / greedy
+  <span class="comment">  │</span>
+  <span class="comment">  ├─</span> _update_states_after_model_execute()
+  <span class="comment">  └─</span> [Spec Decoding] propose_draft_token_ids()</div>
+  </div>
+
+  <div class="file-ref">
+    <span class="path">v1/worker/gpu_model_runner.py</span>:3787 execute &nbsp;|&nbsp;
+    <span class="path">v1/worker/gpu_model_runner.py</span>:1776 prepare &nbsp;|&nbsp;
+    <span class="path">v1/worker/gpu_model_runner.py</span>:4140 sample
+  </div>
+</section>
+
+<!-- ═══════ STAGE 9 ═══════ -->
+<section class="section" id="stage9">
+  <div class="section-label" style="color:var(--accent-engine)">Stage 9</div>
+  <div class="section-title">调度器更新状态</div>
+
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-engine">update_from_output(scheduler_output, model_output)</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> 遍历所有被调度的请求：
+  <span class="comment">│</span>
+  <span class="comment">│  ├─</span> [Spec Decoding] 计算被拒绝的 draft tokens
+  <span class="comment">│  │</span>
+  <span class="comment">│  ├─</span> <span class="fn-engine">_update_request_with_output()</span>
+  <span class="comment">│  │  ├─</span> request.append_output_token_ids(token)
+  <span class="comment">│  │  └─</span> check_stop()
+  <span class="comment">│  │     ├─</span> EOS / max_tokens
+  <span class="comment">│  │     └─</span> stop tokens
+  <span class="comment">│  │</span>
+  <span class="comment">│  ├─</span> [结构化输出] grammar.accept_tokens()
+  <span class="comment">│  │</span>
+  <span class="comment">│  └─</span> 如果 stopped:
+  <span class="comment">│     ├─</span> <span class="fn-engine">_handle_stopped_request()</span>
+  <span class="comment">│     │  └─</span> 释放 KV cache、移出 running
+  <span class="comment">│     └─</span> 创建 EngineCoreOutput
+  <span class="comment">│        ├─</span> new_token_ids: [int]
+  <span class="comment">│        ├─</span> finish_reason
+  <span class="comment">│        └─</span> logprobs
+  <span class="comment">│</span>
+  <span class="comment">└─</span> 返回 EngineCoreOutputs → output_queue → ZMQ → API</div>
+  </div>
+
+  <div style="display:flex;justify-content:center;margin:20px 0">
+    <div class="loop-badge">&#8635; 如果请求未完成，下一轮 schedule() Phase 1 会继续处理 (decode 每轮 1 token)</div>
+  </div>
+
+  <div class="file-ref">
+    <span class="path">v1/core/sched/scheduler.py</span>:1303 update_from_output &nbsp;|&nbsp;
+    <span class="path">v1/core/sched/utils.py</span>:94 check_stop
+  </div>
+</section>
+
+<!-- ═══════ STAGE 10-11 ═══════ -->
+<section class="section" id="stage10-11">
+  <div class="section-label" style="color:var(--accent-purple)">Stage 10-11</div>
+  <div class="section-title">输出处理与流式返回</div>
+
+  <div class="diagram-box mermaid-container">
+    <div class="diagram-title">EngineCore 输出 → Client 返回路径</div>
+    <pre class="mermaid">
+sequenceDiagram
+    participant W as GPUWorker
+    participant S as Scheduler
+    participant E as EngineCore
+    participant M as AsyncMPClient
+    participant A as AsyncLLM
+    participant API as API Server
+    participant C as Client
+
+    Note over W,C: ─── Stage 9: 状态更新 ───
+    W->>S: sampled token ids
+    Note right of S: append tokens<br/>check EOS / max_tokens<br/>build EngineCoreOutput
+    S-->>E: EngineCoreOutput
+
+    Note over W,C: ─── ZMQ 返回 ───
+    Note right of E: output_queue.put()
+    E->>M: ZMQ PUSH msgpack
+    M->>M: decode → outputs_queue
+
+    Note over W,C: ─── Stage 10: 输出处理 ───
+    M->>A: outputs_queue
+    Note right of A: process_outputs()<br/>├ Detokenizer.update()<br/>├ LogprobsProcessor<br/>└ stop strings check
+    A->>A: collector.put()
+
+    Note over W,C: ─── Stage 11: 流式返回 ───
+    A-->>API: generate() yield RequestOutput
+    API->>API: build ChatCompletionStreamResponse
+    API-->>C: SSE: data: {...}
+    Note over W,C: 如果 finished=False → 重复 step()
+    API-->>C: SSE: data: [DONE]
+    </pre>
+  </div>
+
+  <div class="two-col">
+    <div>
+      <div class="diagram-title">OutputProcessor 处理流</div>
+      <div class="callstack"><span class="fn-output">process_outputs(engine_core_outputs)</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> <span class="fn-output">Detokenizer.update()</span>
+  <span class="comment">│  ├─</span> 增量解码 token → 文本
+  <span class="comment">│  │  (FastIncrementalDetokenizer: Rust)
+  <span class="comment">│  └─</span> 检查 stop strings
+  <span class="comment">│</span>
+  <span class="comment">├─</span> LogprobsProcessor.update()
+  <span class="comment">│</span>
+  <span class="comment">├─</span> <span class="fn-output">RequestState.make_request_output()</span>
+  <span class="comment">│  ├─</span> stream_interval 控制
+  <span class="comment">│  └─</span> 创建 RequestOutput
+  <span class="comment">│</span>
+  <span class="comment">└─</span> 放入 per-request collector
+  <span class="comment">   (DELTA 模式: 聚合输出)</span></div>
+    </div>
+    <div>
+      <div class="diagram-title">SSE 流式响应</div>
+      <div class="callstack"><span class="fn-api">chat_completion_stream_generator()</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> for request_output in result_generator:
+  <span class="comment">│  ├─</span> 构建 ChatCompletionStreamResponse
+  <span class="comment">│  │  ├─</span> delta.content (增量文本)
+  <span class="comment">│  │  ├─</span> delta.reasoning_content
+  <span class="comment">│  │  └─</span> usage 信息
+  <span class="comment">│  └─</span> yield SSE: "data: {json}\n\n"
+  <span class="comment">│</span>
+  <span class="comment">└─</span> yield "data: [DONE]\n\n"</div>
+
+      <div style="margin-top:16px">
+        <div class="diagram-title">反分词</div>
+        <div style="font-size:12px;color:var(--text-secondary);line-height:1.8">
+          <code style="color:var(--accent-api)">FastIncrementalDetokenizer</code> — Rust DecodeStream<br>
+          <code style="color:var(--text-muted)">SlowIncrementalDetokenizer</code> — Python 回退<br>
+          <span style="color:var(--text-muted)">增量解码，避免每步对全部历史重新解码</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="file-ref">
+    <span class="path">v1/engine/output_processor.py</span>:572 &nbsp;|&nbsp;
+    <span class="path">v1/engine/detokenizer.py</span>:95 &nbsp;|&nbsp;
+    <span class="path">chat_completion/serving.py</span>:525 stream
+  </div>
+</section>
+
+<!-- ═══════ CROSS-CUTTING ═══════ -->
+<section class="section" id="crosscut">
+  <div class="section-label" style="color:var(--accent-ipc)">Cross-Cutting</div>
+  <div class="section-title">横切关注点</div>
+
+  <div class="two-col">
+    <div class="diagram-box" style="margin:0">
+      <div class="diagram-title" style="color:var(--accent-engine)">结构化输出 (Structured Output)</div>
+      <div class="flow-steps" style="gap:2px">
+        <div class="flow-step" style="padding:8px 12px">
+          <div class="step-num badge-api" style="min-width:24px;height:24px;font-size:10px">S1</div>
+          <div class="step-desc">response_format → SamplingParams</div>
+        </div>
+        <div class="flow-step" style="padding:8px 12px">
+          <div class="step-num badge-api" style="min-width:24px;height:24px;font-size:10px">S4</div>
+          <div class="step-desc">InputProcessor → StructuredOutputRequest</div>
+        </div>
+        <div class="flow-step" style="padding:8px 12px">
+          <div class="step-num badge-engine" style="min-width:24px;height:24px;font-size:10px">S5</div>
+          <div class="step-desc">grammar_init() 异步编译 grammar</div>
+        </div>
+        <div class="flow-step" style="padding:8px 12px">
+          <div class="step-num badge-worker" style="min-width:24px;height:24px;font-size:10px">S8</div>
+          <div class="step-desc">grammar bitmask → logits 屏蔽</div>
+        </div>
+        <div class="flow-step" style="padding:8px 12px">
+          <div class="step-num badge-engine" style="min-width:24px;height:24px;font-size:10px">S9</div>
+          <div class="step-desc">grammar.accept_tokens() 推进状态机</div>
+        </div>
+      </div>
+    </div>
+    <div class="diagram-box" style="margin:0">
+      <div class="diagram-title" style="color:var(--accent-worker)">Speculative Decoding</div>
+      <div class="flow-steps" style="gap:2px">
+        <div class="flow-step" style="padding:8px 12px">
+          <div class="step-num badge-worker" style="min-width:24px;height:24px;font-size:10px">S8</div>
+          <div class="step-desc">propose_draft_token_ids() → N 个候选</div>
+        </div>
+        <div class="flow-step" style="padding:8px 12px">
+          <div class="step-num badge-engine" style="min-width:24px;height:24px;font-size:10px">S5</div>
+          <div class="step-desc">draft tokens 计入 num_tokens_with_spec</div>
+        </div>
+        <div class="flow-step" style="padding:8px 12px">
+          <div class="step-num badge-worker" style="min-width:24px;height:24px;font-size:10px">S7</div>
+          <div class="step-desc">一次 forward 验证所有 draft tokens</div>
+        </div>
+        <div class="flow-step" style="padding:8px 12px">
+          <div class="step-num badge-engine" style="min-width:24px;height:24px;font-size:10px">S9</div>
+          <div class="step-desc">接受/拒绝 → 回退 num_computed_tokens</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="two-col" style="margin-top:16px">
+    <div class="diagram-box" style="margin:0">
+      <div class="diagram-title" style="color:var(--accent-red)">请求 Abort</div>
+      <div style="font-size:12px;color:var(--text-secondary);line-height:1.8">
+        API 进程: generate() CancelledError → abort()<br>
+        EngineCore: _process_aborts_queue() step 间处理<br>
+        Worker: 下一个 _update_states() 中移除
+      </div>
+    </div>
+    <div class="diagram-box" style="margin:0">
+      <div class="diagram-title" style="color:var(--accent-purple)">LoRA</div>
+      <div style="font-size:12px;color:var(--text-secondary);line-height:1.8">
+        S1: ChatCompletionRequest 指定 adapter<br>
+        S5: Scheduler 跟踪 active LoRAs (max_loras)<br>
+        S6: Worker 加载 LoRA weights → GPU<br>
+        S8: CUDA Graph 按 num_active_loras 特化
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════ DATA FLOW ═══════ -->
+<section class="section" id="dataflow">
+  <div class="section-label" style="color:var(--text-muted)">Appendix</div>
+  <div class="section-title">关键数据对象流转</div>
+
+  <div class="diagram-box mermaid-container">
+    <pre class="mermaid">
+flowchart TD
+    A["<b>ChatCompletionRequest</b><br/>messages, temperature, max_tokens"]
+    B["<b>prompt_token_ids</b><br/>list[int] + mm_kwargs"]
+    C["<b>EngineInput</b><br/>token / multimodal / embeds"]
+    D["<b>EngineCoreRequest</b><br/>prompt + SamplingParams + mm_features"]
+    E["<b>Request</b><br/>num_computed, output_ids, status, kv_blocks"]
+    F["<b>SchedulerOutput</b><br/>scheduled reqs, tokens, block_ids"]
+    G["<b>InputBatch</b><br/>input_ids, positions, seq_lens (GPU)"]
+    H["<b>Hidden States</b><br/>GPU tensor"]
+    I["<b>Sampled Token IDs</b><br/>GPU"]
+    J["<b>EngineCoreOutput</b><br/>new_token_ids, finish_reason, logprobs"]
+    K["<b>RequestOutput</b><br/>text, token_ids, logprobs, finished"]
+    L["<b>SSE / JSON Response</b>"]
+
+    A -->|render + tokenize| B
+    B -->|process_for_engine| C
+    C -->|InputProcessor| D
+    D -.->|<b>ZMQ IPC</b>| E
+    E -->|schedule| F
+    F -->|prepare inputs| G
+    G -->|model forward| H
+    H -->|sample| I
+    I -->|update_from_output| J
+    J -.->|<b>ZMQ IPC</b>| K
+    K -->|SSE stream| L
+
+    style A fill:#1c2128,stroke:#58a6ff,color:#e6edf3
+    style B fill:#1c2128,stroke:#58a6ff,color:#e6edf3
+    style C fill:#1c2128,stroke:#58a6ff,color:#e6edf3
+    style D fill:#1c2128,stroke:#58a6ff,color:#e6edf3
+    style E fill:#1c2128,stroke:#3fb950,color:#e6edf3
+    style F fill:#1c2128,stroke:#3fb950,color:#e6edf3
+    style G fill:#1c2128,stroke:#f0883e,color:#e6edf3
+    style H fill:#1c2128,stroke:#f0883e,color:#e6edf3
+    style I fill:#1c2128,stroke:#f0883e,color:#e6edf3
+    style J fill:#1c2128,stroke:#3fb950,color:#e6edf3
+    style K fill:#1c2128,stroke:#bc8cff,color:#e6edf3
+    style L fill:#1c2128,stroke:#bc8cff,color:#e6edf3
+    </pre>
+  </div>
+
+  <div class="legend" style="justify-content:center">
+    <div class="legend-item"><div class="legend-dot" style="background:var(--accent-api)"></div> API Server</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--accent-engine)"></div> Engine Core</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--accent-worker)"></div> GPU Worker</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--accent-purple)"></div> Output</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--accent-ipc)"></div> ZMQ IPC</div>
+  </div>
+</section>
+
+<!-- ═══════ FULL SEQUENCE ═══════ -->
+<section class="section" id="fullseq">
+  <div class="section-label" style="color:var(--text-muted)">Appendix</div>
+  <div class="section-title">压缩完整时序图</div>
+
+  <div class="diagram-box mermaid-container">
+    <pre class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant API as API Server
+    participant A as AsyncLLM
+    participant E as EngineCore
+    participant S as Scheduler
+    participant W as GPUWorker
+
+    C->>API: POST /v1/chat/completions
+    Note right of API: Stage 1: API 接收与解析<br/>Stage 2: 渲染与分词<br/>Stage 3: 多模态处理
+    API->>A: generate()
+    Note right of A: Stage 4: 提交到引擎<br/>├ InputProcessor<br/>├ OutputProcessor.add<br/>└ ZMQ send
+
+    A->>E: ZMQ: ADD
+    E->>S: add_request() → waiting
+
+    rect rgba(63, 185, 80, 0.05)
+    Note over S,W: ── iteration loop (Stage 5-9) ──
+    E->>S: schedule()
+    Note right of S: Phase 1: RUNNING<br/>Phase 2: WAITING → RUNNING
+    S-->>E: SchedulerOutput
+    E->>W: execute_model()
+    Note right of W: Stage 6: prepare inputs<br/>Stage 7: model forward
+    W-->>E: hidden_states
+    E->>W: sample_tokens()
+    Note right of W: Stage 8: grammar + sample
+    W-->>E: sampled ids
+    E->>S: update_from_output()
+    Note right of S: Stage 9: append + stop
+    end
+
+    E->>A: ZMQ PUSH EngineCoreOutputs
+    Note right of A: Stage 10: detokenize<br/>+ logprobs + stop strings
+    A-->>API: yield RequestOutput
+    Note right of API: Stage 11: SSE
+    API-->>C: data: {...}
+
+    Note over S,W: 重复 iteration 直到 finished
+    API-->>C: data: [DONE]
+    </pre>
+  </div>
+
+  <div class="file-ref">完整代码阅读顺序见 request.md 第 14 节（7 个阶段，33 个文件）</div>
+</section>
+
+</div><!-- end .main -->
+
+<script>
+// Mermaid initialization
+mermaid.initialize({
+  startOnLoad: true,
+  theme: 'dark',
+  themeVariables: {
+    fontFamily: '"Inter", sans-serif',
+    fontSize: '13px',
+    primaryColor: '#1c2128',
+    primaryTextColor: '#e6edf3',
+    primaryBorderColor: '#30363d',
+    lineColor: '#484f58',
+    secondaryColor: '#161b22',
+    tertiaryColor: '#21262d',
+    actorTextColor: '#e6edf3',
+    actorBkg: '#1c2128',
+    actorBorder: '#30363d',
+    actorLineColor: '#30363d',
+    signalColor: '#e6edf3',
+    signalTextColor: '#8b949e',
+    labelBoxBkgColor: '#161b22',
+    labelBoxBorderColor: '#30363d',
+    labelTextColor: '#e6edf3',
+    loopTextColor: '#e6edf3',
+    noteBkgColor: '#1c2128',
+    noteTextColor: '#e6edf3',
+    noteBorderColor: '#30363d',
+    activationBorderColor: '#1f6feb',
+    activationBkgColor: '#1f6feb22',
+    sequenceNumberColor: '#e6edf3',
+  },
+  sequence: {
+    actorMargin: 60,
+    messageMargin: 30,
+    mirrorActors: false,
+    useMaxWidth: false,
+    wrap: true,
+    wrapPadding: 10,
+  },
+  flowchart: {
+    htmlLabels: true,
+    curve: 'basis',
+    useMaxWidth: true,
+  }
+});
+
+// Navigation active state
+const sections = document.querySelectorAll('.section, .hero');
+const navLinks = document.querySelectorAll('.nav a');
+
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(entry => {
+    if (entry.isIntersecting) {
+      const id = entry.target.id;
+      navLinks.forEach(link => {
+        link.classList.toggle('active', link.getAttribute('href') === '#' + id);
+      });
+    }
+  });
+}, { rootMargin: '-20% 0px -60% 0px' });
+
+sections.forEach(section => {
+  if (section.id) observer.observe(section);
+});
+
+// Close mobile nav on link click
+navLinks.forEach(link => {
+  link.addEventListener('click', () => {
+    document.querySelector('.nav').classList.remove('open');
+  });
+});
+</script>
+</body>
+</html>
