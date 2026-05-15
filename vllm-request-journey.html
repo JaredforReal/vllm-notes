@@ -618,14 +618,15 @@ body {
   <div class="section-title">API 接收与解析</div>
 
   <div class="legend">
-    <div class="legend-item"><div class="legend-dot" style="background:var(--accent-api)"></div> API Server</div>
-    <div class="legend-item"><div class="legend-dot" style="background:var(--accent-engine)"></div> AsyncLLM</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--accent-api)"></div> ServingChat</div>
+    <div class="legend-item"><div class="legend-dot" style="background:#a5d6ff"></div> ServingRender</div>
     <div class="legend-item"><div class="legend-dot" style="background:#79c0ff"></div> Renderer</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--accent-engine)"></div> AsyncLLM</div>
   </div>
 
   <div class="two-col">
     <div>
-      <div class="diagram-title">ChatCompletion请求对象</div>
+      <div class="diagram-title">请求对象</div>
       <div class="callstack"><span class="fn-api">ChatCompletionRequest</span> &nbsp;(Pydantic model)
   model, messages, temperature, max_tokens
   stop, stop_token_ids, logprobs
@@ -649,15 +650,19 @@ sequenceDiagram
     participant C as Client
     participant R as API Router
     participant S as ServingChat
+    participant SR as ServingRender
     participant Ren as Renderer
     participant A as AsyncLLM
 
     C->>R: POST /v1/chat/completions
     R->>S: create_chat_completion()
-    Note over S: 校验 model / request params
-    S->>Ren: render_chat_request()
-    Note over Ren: render_messages()<br/>tokenize_prompts()<br/>process MM inputs
-    Ren-->>S: prompt_token_ids / mm_data
+    Note over S: _check_model() / engine health
+    S->>SR: openai_serving_render.render_chat()
+    Note over SR: validate_chat_template<br/>preprocess_chat()
+    SR->>Ren: renderer.render_chat_async()
+    Note over Ren: Step 1: render_messages<br/>Step 2: tokenize_prompts<br/>Step 3: apply_prompt_extras<br/>Step 4: process_for_engine
+    Ren-->>SR: EngineInput
+    SR-->>S: engine_inputs
     Note over S: to_sampling_params()
     S->>A: engine_client.generate()
     Note over A: 返回 async generator
@@ -670,7 +675,8 @@ sequenceDiagram
   <div class="file-ref">
     <span class="path">entrypoints/openai/api_server.py</span> &rarr;
     <span class="path">chat_completion/api_router.py</span> &rarr;
-    <span class="path">chat_completion/serving.py</span>:229
+    <span class="path">chat_completion/serving.py</span>:229 &rarr;
+    <span class="path">serve/render/serving.py</span>:184
   </div>
 </section>
 
