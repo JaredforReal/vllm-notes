@@ -831,11 +831,22 @@ GPUModelRunner.execute_model(scheduler_output) (行 3787)
   │    ├─ [Decode] 合并上次采样 token + draft tokens
   │    └─ Triton kernel 计算 positions 和 seq_lens
   │
+  ├─ _preprocess()                            (行 3211)
+  │    ├─ [有 MM] _execute_mm_encoder()       (行 2733)
+  │    │    ├─ _batch_mm_inputs_from_scheduler() → mm_kwargs
+  │    │    ├─ 按 modality 分组 batch
+  │    │    ├─ model.embed_multimodal(**mm_kwargs) → MM embeddings
+  │    │    │    └─ vision / audio encoder forward → MultiModalEmbeddings
+  │    │    └─ 缓存到 encoder_cache[mm_hash]
+  │    ├─ [有 MM] _gather_mm_embeddings() → 从 cache 取出并合并
+  │    └─ [有 MM] embed_input_ids(token_ids, multimodal_embeddings) → inputs_embeds
+  │         └─ 统一 token ids 和 soft tokens (vision embeddings) 为 embedding 输入
+  │
   ├─ [FULL CUDA Graph] → cudagraph_manager.run_fullgraph() → graph.replay()
   │
   ├─ [Eager / PIECEWISE] → model(**model_inputs)
   │    ├─ Embedding lookup（input_ids → hidden_states）
-  │    ├─ [多模态] 注入 vision/audio embeddings 到对应位置
+  │    ├─ [有 MM] inputs_embeds 已含 MM embeddings, 跳过 token embedding
   │    ├─ N × TransformerLayer（RMSNorm → Attention → RMSNorm → FFN/MoE）
   │    └─ Final RMSNorm → Linear → logits
   │

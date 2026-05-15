@@ -1099,12 +1099,14 @@ sequenceDiagram
   <span class="comment">├─</span> 持久化批次状态: InputBatch (所有活跃请求的 GPU tensor 汇总)
   <span class="comment">├─</span> 接收 SchedulerOutput → 更新 InputBatch
   <span class="comment">├─</span> _prepare_inputs() → 构建 GPU 输入 (positions, attn metadata)
+  <span class="comment">├─</span> <span class="fn-mm">_preprocess()</span> → 多模态编码器 + embedding 合并
   <span class="comment">├─</span> model forward → logits → 暂存到 execute_model_state
   <span class="comment">└─</span> 后续被 sample_tokens() 调用: grammar + 采样 + bookkeeping
 
 <span style="color:var(--accent-cyan);font-weight:600">Model</span> <span class="comment">(torch.nn.Module)</span>
   <span class="comment">├─</span> Embedding → N × TransformerLayer → logits
-  <span class="comment">└─</span> 每层: RMSNorm → Attention (PagedAttention) → RMSNorm → FFN/MoE</div>
+  <span class="comment">├─</span> 每层: RMSNorm → Attention (PagedAttention) → RMSNorm → FFN/MoE
+  <span class="comment">└─</span> [多模态] model.embed_multimodal() → vision/audio encoder → MM embeddings</div>
   </div>
 
   <div class="diagram-title" style="font-weight:400;font-size:12px">execute_model() 调用栈</div>
@@ -1123,10 +1125,19 @@ sequenceDiagram
   <span class="comment">│  ├─</span> [Prefill] Triton kernel 填 input_ids
   <span class="comment">│  └─</span> [Decode] 合并上次 token + drafts
   <span class="comment">│</span>
+  <span class="comment">├─</span> <span class="fn-mm">_preprocess()</span> <span class="comment">(行 3211)</span>
+  <span class="comment">│  ├─</span> [有 MM] <span class="fn-mm">_execute_mm_encoder()</span> <span class="comment">(行 2733)</span>
+  <span class="comment">│  │  ├─</span> _batch_mm_inputs_from_scheduler() → mm_kwargs
+  <span class="comment">│  │  ├─</span> 按 modality 分组 batch
+  <span class="comment">│  │  ├─</span> <span class="fn-mm">model.embed_multimodal(**mm_kwargs)</span> → MM embeddings
+  <span class="comment">│  │  └─</span> 缓存到 encoder_cache[mm_hash]
+  <span class="comment">│  ├─</span> [有 MM] _gather_mm_embeddings() → 从 cache 取出并合并
+  <span class="comment">│  └─</span> [有 MM] embed_input_ids(token_ids, multimodal_embeddings) → inputs_embeds
+  <span class="comment">│</span>
   <span class="comment">├─</span> [CUDA Graph] → graph.replay()
   <span class="comment">├─</span> [Eager] → <span class="fn-worker">model(**model_inputs)</span>
   <span class="comment">│  ├─</span> Embedding → N × TransformerLayer → logits
-  <span class="comment">│  └─</span> [多模态] 注入 vision/audio embeddings
+  <span class="comment">│  └─</span> [有 MM] inputs_embeds 已含 MM embeddings, 跳过 token embedding
   <span class="comment">│</span>
   <span class="comment">└─</span> 暂存 logits → execute_model_state, 返回 <span class="comment">None</span></div>
   </div>
