@@ -18,13 +18,9 @@
 3. [Stage 2：渲染与分词](#3-stage-2渲染与分词)
 4. [Stage 3：多模态处理](#4-stage-3多模态处理)
 5. [Stage 4：提交到引擎](#5-stage-4提交到引擎)
-6. [Stage 5：调度排队](#6-stage-5调度排队)
-7. [Stage 6：Worker 输入准备](#7-stage-6worker-输入准备)
-8. [Stage 7：模型前向推理](#8-stage-7模型前向推理)
-9. [Stage 8：采样](#9-stage-8采样)
-10. [Stage 9：调度器更新状态](#10-stage-9调度器更新状态)
-11. [Stage 10：输出处理与反分词](#11-stage-10输出处理与反分词)
-12. [Stage 11：流式返回](#12-stage-11流式返回)
+6. [The Iteration Loop：EngineCore.step()](#6-the-iteration-loopenginecorestep)
+7. [Stage 10：输出处理与反分词](#7-stage-10输出处理与反分词)
+8. [Stage 11：流式返回](#8-stage-11流式返回)
 13. [横切关注点](#13-横切关注点)
 14. [代码阅读顺序](#14-代码阅读顺序)
 
@@ -48,21 +44,20 @@
 │     │                                                                   │
 │     │  ═══════════ ZMQ IPC ═══════════                                  │
 │     │                                                                   │
-│  Engine Core 进程                                                       │
+│  Engine Core 进程  ─── 编排者：EngineCore.step()                         │
 │     │                                                                   │
-│     ├─ Stage 5: 调度排队 ──────── Scheduler + KV Cache 分配            │
+│     ├─ Phase 1 / Stage 5:  调度 ───── Scheduler + KV Cache 分配         │
 │     │                                                                   │
-│     │  ═══════════ 内部调用 ═══════════                                  │
+│     │  ═════ model_executor 分发到 Worker ═════                          │
 │     │                                                                   │
-│  Worker 进程 (GPU)                                                      │
+│  Worker 进程 (GPU)                                                       │
 │     │                                                                   │
-│     ├─ Stage 6: Worker 输入准备 ── GPU tensor 构建、block table 更新    │
-│     ├─ Stage 7: 模型前向推理 ──── Transformer forward pass              │
-│     ├─ Stage 8: 采样 ──────────── Logits → Sampler → Token IDs          │
+│     ├─ Phase 2 / Stage 6-7: 模型执行 ── tensor 构建 + forward pass      │
+│     ├─ Phase 3 / Stage 8:   采样 ────── grammar mask + GPU sampler      │
 │     │                                                                   │
-│     │  ═══════════ 返回 Engine Core ═══════════                          │
+│     │  ═════ 返回 EngineCore 进程 ═════                                  │
 │     │                                                                   │
-│     ├─ Stage 9: 调度器更新状态 ── 追加 token、检查停止、释放资源        │
+│     ├─ Phase 4 / Stage 9:   状态更新 ── 追加 token、检查停止、释放资源   │
 │     │                                                                   │
 │     │  ═══════════ ZMQ IPC ═══════════                                  │
 │     │                                                                   │
@@ -76,23 +71,18 @@
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-**注意**：Stage 5-9 在每个 iteration 中重复执行（每步生成一个或多个 token），直到请求完成。
+**注意**：Phase 1-4（Stage 5-9）在 EngineCore.step() 的每次调用中执行（每步生成一个或多个
+token），直到请求完成。EngineCore.step() 是唯一的编排者；Worker 不自主驱动。
 
 ### 阅读路径
 
 建议按三层来读：
 
-1. 先看本节总图，建立进程边界：API Server → EngineCore → GPU Worker → API Server。
+1. 先看本节总图，建立进程边界：API Server → EngineCore（编排者）→ GPU Worker → API Server。
 2. 再看 Stage 1-4，理解一个 HTTP request 如何被解析、渲染、分词、多模态处理，并提交成
    `EngineCoreRequest`。
-3. 最后看 Stage 5-11，理解 request 如何在每个 engine iteration 中被调度、执行、采样、更新状态，
-   再被反分词并返回给客户端。
-
-文中有三类图：
-
-- **时序图**：说明调用顺序和跨进程边界，放在对应 stage 附近。
-- **调用栈图**：说明某个复杂模块内部如何逐层调用，例如 renderer / multimodal processor。
-- **数据对象流转图**：放在附录，用于回顾各阶段核心对象如何变形。
+3. 最后看 The Iteration Loop，理解 `EngineCore.step()` 如何通过四个 phase 编排
+   调度、模型执行、采样和状态更新，再被反分词并返回给客户端。
 
 
 ---
@@ -654,7 +644,19 @@ generator，后续从 per-request collector 拉取输出并逐步 `yield`。
 
 ---
 
-## 6. Stage 5：调度排队
+## 6. The Iteration Loop：EngineCore.step()
+
+Stage 5-9 在每个 engine iteration 中重复执行。它们不是独立的阶段，而是
+`EngineCore.step()` 一次调用内的四个 phase。本节先建立 step() 的全局视角，
+再逐 phase 展开。
+
+### 先区分进程边界
+
+- **EngineCore 进程**：运行 `Scheduler`（CPU），持有 `model_executor`，
+  通过 `model_executor` 把工作分发给 Worker 进程。
+- **Worker 进程**：运行 `GPUModelRunner`（CPU + GPU），执行模型 forward 和采样。
+  Worker 不自主驱动，每一步都由 EngineCore.step() 编排。
+- **EngineCore.step()** 是唯一的编排者——调度、分发、收集、更新都在这一个函数调用中完成。
 
 ### EngineCore 接收
 
@@ -700,11 +702,47 @@ EngineCoreProc.run_busy_loop() (行 1164)
 多模态 tensor IPC、grammar 初始化等输入侧工作能和 GPU 前向有重叠。主循环不直接读 socket，
 它只读进程内 `input_queue`。
 
-`_process_input_queue()` 的阻塞策略也很关键：如果当前没有任何 running/waiting/batch-queue work，
-它会阻塞等待新输入；一旦 scheduler 已经有未完成请求，它就不长期阻塞，而是在每个 step 前尽量
-drain 已到达的输入，然后继续执行下一轮模型 iteration。
+### step() 总览
 
-### Scheduler 调度
+**文件**: `vllm/v1/engine/core.py:402`
+
+```
+EngineCore.step()
+  │
+  ├── Phase 1: Scheduler.schedule()              [CPU, EngineCore 进程]
+  │     └── 返回 SchedulerOutput
+  │
+  ├── Phase 2: model_executor.execute_model()    [GPU, Worker 进程, non-blocking]
+  │     └── 模型 forward → logits 暂存, 返回 None
+  │
+  │  ┌─ get_grammar_bitmask()                    [CPU, EngineCore 进程]
+  │  │   与 Phase 2 的 GPU 执行并行
+  │  └─
+  │
+  ├── future.result()                            [等待 GPU 完成]
+  │
+  ├── Phase 3: model_executor.sample_tokens()    [GPU, Worker 进程]
+  │     ├── apply_grammar_bitmask() → GPU tensor 操作
+  │     ├── Sampler.forward() → top-k/top-p/argmax（全部 GPU）
+  │     ├── _bookkeeping_sync() → GPU→CPU 拷贝采样结果
+  │     └── 返回 ModelRunnerOutput
+  │
+  ├── _process_aborts_queue()                    [CPU, EngineCore 进程]
+  │
+  └── Phase 4: Scheduler.update_from_output()   [CPU, EngineCore 进程]
+        ├── 追加 token、检查停止条件、释放 KV cache
+        └── 返回 EngineCoreOutputs
+```
+
+**设计要点**：Phase 2 和 Phase 3 的拆分是刻意为之。`execute_model()` 返回 `None`（不等待采样），
+这样 EngineCore 可以在 GPU 跑 forward 的同时并行计算 grammar bitmask。等 GPU forward 完成后，
+再调用 `sample_tokens()` 应用 bitmask 并采样。这避免了 grammar 计算与 GPU 执行的串行化。
+
+**采样全程在 GPU 完成**。`Sampler.forward()` 操作 CUDA tensor，top-k/top-p 使用 FlashInfer
+CUDA kernel，刻意避免 `torch.multinomial`（会触发 GPU→CPU 同步）。唯一的 CPU 转移是
+`_bookkeeping_sync()` 把采样结果从 GPU tensor 拷到 Python list 用于构建 `ModelRunnerOutput`。
+
+### Phase 1: Schedule — Stage 5
 
 **文件**: `vllm/v1/core/sched/scheduler.py`
 
@@ -735,303 +773,210 @@ schedule()
 
 **新的请求就在 Phase 2 中被从 waiting 队列取出，分配 KV cache，进入 running 列表。**
 
-### AsyncLLM → EngineCore → GPUWorker 单轮执行时序图
+### Phase 2: Model Execution — Stage 6-7
 
-这一段关注 request 已经提交到 EngineCore 之后，每个 engine iteration 如何推进。`AsyncLLM`
-不直接调用 GPUWorker；它只通过 `EngineCoreClient` 发送请求、接收输出。真正的 worker 调用发生在
-EngineCore 进程里的 `model_executor.execute_model()`。
+EngineCore 通过 `model_executor.execute_model(scheduler_output)` 把 `SchedulerOutput`
+发给 Worker 进程。Worker 侧由 `GPUModelRunner` 接收并执行。
+
+#### Worker / ModelRunner / Model 三层架构
 
 ```
-AsyncLLM              AsyncMPClient             EngineCoreProc            Scheduler              ModelExecutor / GPUWorker
-  │                         │                         │                         │                            │
-  │ add_request()           │                         │                         │                            │
-  │ ├ OutputProcessor.add   │                         │                         │                            │
-  │ └ add_request_async()   │                         │                         │                            │
-  │────────────────────────>│                         │                         │                            │
-  │                         │ ZMQ ROUTER send ADD     │                         │                            │
-  │                         │────────────────────────>│ input socket thread     │                            │
-  │                         │                         │ ├ decode request        │                            │
-  │                         │                         │ ├ preprocess_add_request│                            │
-  │                         │                         │ └ input_queue.put(ADD)  │                            │
-  │                         │                         │                         │                            │
-  │                         │                         │ run_busy_loop()         │                            │
-  │                         │                         │ ├ input_queue.get()     │                            │
-  │                         │                         │ └ _handle_client_request│                            │
-  │                         │                         │────────────────────────>│ add_request()              │
-  │                         │                         │                         │ └ waiting.push(request)    │
-  │                         │                         │                         │                            │
-  │                         │                         │ step()                  │                            │
-  │                         │                         │────────────────────────>│ schedule()                 │
-  │                         │                         │                         │ ├ running decode requests  │
-  │                         │                         │                         │ ├ waiting prefill requests │
-  │                         │                         │                         │ ├ allocate KV blocks       │
-  │                         │                         │                         │ └ SchedulerOutput          │
-  │                         │                         │<────────────────────────│                            │
-  │                         │                         │                         │                            │
-  │                         │                         │ execute_model(output)   │                            │
-  │                         │                         │───────────────────────────────────────────────────────>│
-  │                         │                         │                         │                            │ GPUWorker.execute_model()
-  │                         │                         │                         │                            │ ├ _update_states()
-  │                         │                         │                         │                            │ ├ prepare input tensors
-  │                         │                         │                         │                            │ ├ model forward
-  │                         │                         │                         │                            │ └ stash logits/hidden states
-  │                         │                         │<───────────────────────────────────────────────────────│
-  │                         │                         │ future.result()         │                            │
-  │                         │                         │                         │                            │
-  │                         │                         │ get_grammar_bitmask()   │                            │
-  │                         │                         │────────────────────────>│ structured output mask      │
-  │                         │                         │<────────────────────────│                            │
-  │                         │                         │                         │                            │
-  │                         │                         │ sample_tokens(mask)     │                            │
-  │                         │                         │───────────────────────────────────────────────────────>│
-  │                         │                         │                         │                            │ ├ apply grammar mask
-  │                         │                         │                         │                            │ ├ logits processors
-  │                         │                         │                         │                            │ └ sample token ids
-  │                         │                         │<───────────────────────────────────────────────────────│
-  │                         │                         │ ModelRunnerOutput       │                            │
-  │                         │                         │                         │                            │
-  │                         │                         │ update_from_output()    │                            │
-  │                         │                         │────────────────────────>│ append tokens / stop check  │
-  │                         │                         │                         │ free finished KV blocks     │
-  │                         │                         │                         │ build EngineCoreOutputs     │
-  │                         │                         │<────────────────────────│                            │
-  │                         │                         │ output_queue.put(...)   │                            │
-  │                         │                         │ output socket thread    │                            │
-  │                         │<────────────────────────│ ZMQ PUSH EngineCoreOutputs                            │
-  │ outputs_queue.put(...)  │                         │                         │                            │
-  │<────────────────────────│                         │                         │                            │
-  │ output_handler          │                         │                         │                            │
-  │ ├ process_outputs()     │                         │                         │                            │
-  │ └ collector.put(output) │                         │                         │                            │
+GPU Worker 进程
+  │
+  ├─ Worker（gpu_worker.py）
+  │    ├─ 绑定 rank / local_rank，管理一个 accelerator device
+  │    ├─ 初始化分布式通信和 GPU 内存
+  │    └─ 持有一个 ModelRunner
+  │
+  ├─ GPUModelRunner（gpu_model_runner.py）
+  │    ├─ 持久化批次状态：InputBatch（所有活跃请求的 GPU tensor 汇总）
+  │    ├─ 接收 SchedulerOutput → 更新 InputBatch
+  │    ├─ _prepare_inputs() → 构建 GPU 输入（positions, attention metadata 等）
+  │    ├─ 调用 model forward → 得到 logits
+  │    ├─ 暂存 logits 到 execute_model_state，返回 None（不采样）
+  │    └─ 后续被 sample_tokens() 调用时：应用 grammar + 采样 + bookkeeping
+  │
+  └─ Model（torch.nn.Module）
+       ├─ Embedding lookup（input_ids → hidden_states）
+       ├─ N × TransformerLayer
+       │    ├─ RMSNorm → Self-Attention（PagedAttention, 读写 KV cache）
+       │    └─ RMSNorm → FFN / MoE
+       └─ Final RMSNorm → Linear → logits
 ```
 
-这一轮结束后，如果 request 没有 finished，它仍在 Scheduler 的 running 集合里。下一轮
-`schedule()` 会在 Phase 1 继续调度它，通常 decode 阶段每轮只追加 1 个新 token；如果启用了
-speculative decoding，则一轮可能同时验证多个 draft token。
+`rank` 用于全局分布式编排；`local_rank` 用于选择本机 accelerator。
+EngineCore 不直接调用 `torch.nn.Module`，而是把 `SchedulerOutput` 交给 Worker；
+Worker 内部由 ModelRunner 管理 GPU 侧的全部状态。
 
-这里的关键边界是：
+#### execute_model() 调用栈
 
-- `AsyncLLM ↔ EngineCoreProc`：跨进程 ZMQ + msgpack，传的是 `EngineCoreRequest` /
-  `EngineCoreOutputs`。
-- `EngineCoreProc ↔ Scheduler`：同进程 Python 调用，传的是内部 `Request`、`SchedulerOutput`。
-- `EngineCoreProc ↔ GPUWorker`：通过 `model_executor` 调用 executor/worker，传的是
-  `SchedulerOutput`，worker 侧再构建 GPU tensor、执行 forward 和采样。
+默认路径（`VLLM_USE_V2_MODEL_RUNNER=0`）：
+
+**文件**: `vllm/v1/worker/gpu_model_runner.py`
+
+```
+GPUModelRunner.execute_model(scheduler_output) (行 3787)
+  │
+  ├─ _update_states(scheduler_output)        (行 1061)
+  │    ├─ 移除 finished 请求的 cached state / InputBatch 条目
+  │    ├─ 释放 encoder cache、处理需要清零的新 KV cache blocks
+  │    ├─ 写入 new / resumed / running 的请求状态
+  │    └─ 更新 block table、采样元数据、LoRA 状态
+  │
+  ├─ _prepare_inputs()                      (行 1776)
+  │    ├─ 排序请求（decode 在前，prefill 在后）
+  │    ├─ 构建 idx_mapping（request → batch index）
+  │    ├─ 计算 query_start_loc（attention 的 cumsum）
+  │    ├─ [Prefill] Triton kernel 填充 input_ids
+  │    ├─ [Decode] 合并上次采样 token + draft tokens
+  │    └─ Triton kernel 计算 positions 和 seq_lens
+  │
+  ├─ [FULL CUDA Graph] → cudagraph_manager.run_fullgraph() → graph.replay()
+  │
+  ├─ [Eager / PIECEWISE] → model(**model_inputs)
+  │    ├─ Embedding lookup（input_ids → hidden_states）
+  │    ├─ [多模态] 注入 vision/audio embeddings 到对应位置
+  │    ├─ N × TransformerLayer（RMSNorm → Attention → RMSNorm → FFN/MoE）
+  │    └─ Final RMSNorm → Linear → logits
+  │
+  └─ 暂存 logits 到 execute_model_state，返回 None
+```
+
+V2 路径（`VLLM_USE_V2_MODEL_RUNNER=1`）对应文件 `vllm/v1/worker/gpu/model_runner.py:955`，
+结构更模块化。
+
+**关键**：`execute_model()` 不做采样。logits 暂存在 GPU 上，等后续 `sample_tokens()` 取出。
+这为 grammar bitmask 与 GPU forward 并行留下了空间。
+
+### Phase 3: Sample — Stage 8
+
+**文件**: `vllm/v1/worker/gpu_model_runner.py:4140`
+
+`sample_tokens()` 由 EngineCore.step() 在 GPU forward 完成后调用：
+
+```
+GPUModelRunner.sample_tokens(grammar_output) (行 4140)
+  │
+  ├─ 从 execute_model_state 取出 logits（GPU tensor）
+  │
+  ├─ [结构化输出] apply_grammar_bitmask() → 将不允许的 token 设为 -inf (GPU)
+  │     (v1/structured_output/utils.py:44)
+  │
+  ├─ _sample(logits, ...) → Sampler.forward() (GPU)
+  │     ├─ apply_logits_processors():
+  │     │    ├─ logit_bias / allowed_token_ids
+  │     │    ├─ frequency / presence / repetition penalty
+  │     │    ├─ temperature 缩放
+  │     │    └─ min-p / top-k / top-p 过滤
+  │     └─ top-k/top-p sampler（FlashInfer CUDA kernel）或 greedy (argmax)
+  │          全程 GPU，避免 torch.multinomial 的 GPU→CPU 同步
+  │
+  ├─ _update_states_after_model_execute() → 更新 GPU 侧请求状态
+  │
+  ├─ _bookkeeping_sync() → GPU tensor sampled_ids → Python list[int]
+  │
+  ├─ [Speculative Decoding] propose_draft_token_ids()
+  │     → 用 draft model 生成候选 token（如果启用）
+  │
+  └─ 返回 ModelRunnerOutput（CPU Python 对象，含 sampled token ids、logprobs 等）
+```
+
+### Phase 4: State Update — Stage 9
+
+**文件**: `vllm/v1/core/sched/scheduler.py:1303`
+
+回到 EngineCore 进程。`step()` 拿到 `ModelRunnerOutput` 后调用：
+
+```
+Scheduler.update_from_output(scheduler_output, model_output) (行 1303)
+  │
+  ├── 遍历所有被调度的请求：
+  │     ├── [Spec Decoding] 计算被拒绝的 draft tokens，回退 num_computed_tokens
+  │     ├── _update_request_with_output() (行 1635)
+  │     │    ├── request.append_output_token_ids(token)
+  │     │    └── check_stop() → 检查 EOS / max_tokens / stop tokens
+  │     ├── [结构化输出] grammar.accept_tokens() 推进状态机
+  │     └── 如果 stopped:
+  │           ├── _handle_stopped_request() → 释放 KV cache、移出 running
+  │           └── 创建 EngineCoreOutput
+  │                 ├── new_token_ids: [int]
+  │                 ├── finish_reason
+  │                 └── logprobs
+  │
+  └── 返回 EngineCoreOutputs → output_queue → ZMQ PUSH → API 进程
+```
+
+**如果请求未完成**，下一轮 `schedule()` 的 Phase 1 会继续调度它（decode 每轮 1 token；
+speculative decoding 时一轮可验证多个 draft token）。
+
+### 单轮执行时序图
+
+`AsyncLLM` 不直接调用 GPUWorker；它只通过 `EngineCoreClient` 发送请求、接收输出。
+以下时序图展示一个完整 iteration（从 EngineCoreProc 收到请求开始）：
+
+```
+EngineCoreProc            Scheduler              GPUWorker
+  │                           │                       │
+  │ Phase 1: schedule()       │                       │
+  │──────────────────────────>│                       │
+  │                           │ ├ RUNNING decode      │
+  │                           │ ├ WAITING → RUNNING   │
+  │                           │ ├ allocate KV blocks   │
+  │                           │ └ SchedulerOutput      │
+  │<──────────────────────────│                       │
+  │                           │                       │
+  │ Phase 2: execute_model()  │                       │
+  │──────────────────────────────────────────────────>│
+  │                           │                       │ _update_states()
+  │ get_grammar_bitmask()     │                       │ _prepare_inputs()
+  │──────────────────────────>│                       │ model forward
+  │<──────────────────────────│                       │ → logits 暂存
+  │ (与 GPU forward 并行)     │                       │
+  │                           │                       │
+  │ future.result()  ←────────────────────────────────│ 返回 None
+  │                           │                       │
+  │ Phase 3: sample_tokens()  │                       │
+  │──────────────────────────────────────────────────>│
+  │                           │                       │ apply grammar mask
+  │                           │                       │ Sampler (GPU)
+  │                           │                       │ bookkeeping sync
+  │<──────────────────────────────────────────────────│ ModelRunnerOutput
+  │                           │                       │
+  │ Phase 4: update_from_output()                     │
+  │──────────────────────────>│                       │
+  │                           │ append tokens          │
+  │                           │ check stop             │
+  │                           │ free KV if done        │
+  │<──────────────────────────│                       │
+  │                           │                       │
+  │ output_queue.put() → ZMQ PUSH → API 进程          │
+```
+
+**进程边界总结**：
+
+- `EngineCoreProc ↔ Scheduler`：同进程 Python 调用，传 `Request`、`SchedulerOutput`
+- `EngineCoreProc ↔ GPUWorker`：通过 `model_executor` 跨进程调用，传 `SchedulerOutput`，
+  Worker 侧构建 GPU tensor、执行 forward 和采样
+- `EngineCore → API`：通过 ZMQ PUSH/PUSH 返回 `EngineCoreOutputs`
 
 ### EngineCore 输出返回
 
-`EngineCore.step()` 返回的是 `dict[int, EngineCoreOutputs]`：key 是 `client_index`，
-value 是要发回该 frontend 的一批输出。`EngineCoreProc._process_engine_step()` 会把每个
+`EngineCore.step()` 返回 `dict[int, EngineCoreOutputs]`：key 是 `client_index`，
+value 是要发回该 frontend 的一批输出。`EngineCoreProc._process_engine_step()` 把每个
 `(client_index, EngineCoreOutputs)` 放入 `output_queue`；输出线程
-`process_output_sockets()` 再把它编码成 msgpack，通过对应的 ZMQ PUSH socket 发回 API 进程。
+`process_output_sockets()` 编码成 msgpack，通过 ZMQ PUSH 发回 API 进程。
 
 `EngineCoreOutputs` 里可能包含三类信息：
 
 - `outputs`: token / pooling 维度的 `EngineCoreOutput` 列表，后续由前端 `OutputProcessor`
   转成 `RequestOutput`。
 - `scheduler_stats`: scheduler 统计信息，前端 output handler 用于指标记录。
-- `utility_output`: 控制面 RPC 的结果，`AsyncMPClient` 会用 `call_id` 唤醒对应 future，不进入
+- `utility_output`: 控制面 RPC 的结果，`AsyncMPClient` 用 `call_id` 唤醒对应 future，不进入
   普通 request 输出路径。
 
 ---
 
-## 7. Stage 6：Worker 输入准备
-
-### Worker / ModelRunner / Model 的边界
-
-官方架构页把 GPU 执行侧拆成三层：
-
-```
-GPU Worker process
-  │
-  ├─ Worker
-  │    ├─ 绑定 rank / local_rank
-  │    ├─ 管理一个 accelerator device
-  │    ├─ 初始化分布式通信和 GPU 内存
-  │    └─ 持有一个 model runner
-  │
-  ├─ ModelRunner
-  │    ├─ 加载模型
-  │    ├─ 根据 SchedulerOutput 准备 GPU tensors
-  │    ├─ 管理 CUDA Graph / attention metadata / InputBatch
-  │    ├─ 调用 model forward
-  │    └─ 执行 logits 处理与采样
-  │
-  └─ Model
-       └─ 真正的 torch.nn.Module：embedding、attention、MLP/MoE、LM head 等
-```
-
-`rank` 用于全局分布式编排；`local_rank` 主要用于选择本机 accelerator 和访问本地资源。
-从 request 角度看，EngineCore 不直接调用 `torch.nn.Module`，而是把 `SchedulerOutput`
-交给 executor/worker；worker 再委托 model runner 生成 GPU 输入并调用 model。
-
-### execute_model()
-
-默认路径（`VLLM_USE_V2_MODEL_RUNNER=0`）：
-
-**文件**: `vllm/v1/worker/gpu_model_runner.py`
-
-可选 V2 路径（`VLLM_USE_V2_MODEL_RUNNER=1`）：
-
-**文件**: `vllm/v1/worker/gpu/model_runner.py`
-
-选择逻辑在 `vllm/v1/worker/gpu_worker.py:153` 和 `gpu_worker.py:295-310`。
-
-`GPUModelRunner.execute_model()` 首先更新持久化批次状态：
-
-```
-_update_states(scheduler_output)        # 默认路径：gpu_model_runner.py:1061
-  ├── 移除 finished_req_ids 对应的 cached state / InputBatch 条目
-  ├── 释放 encoder cache、处理需要清零的新 KV cache blocks
-  ├── 写入 scheduled_new_reqs / resumed / running 的请求状态
-  └── 更新 persistent InputBatch 的 block table、采样元数据和 LoRA 状态
-```
-
-### _prepare_inputs()
-
-默认路径中是 `_prepare_inputs()` (行 1776) 构建 GPU 输入张量：
-
-```
-_prepare_inputs()
-  ├── 排序请求（decode 在前，prefill 在后）
-  ├── 构建 idx_mapping（request → batch index）
-  ├── 计算 query_start_loc（attention 的 cumsum）
-  ├── [Prefill] Triton kernel 填充 input_ids
-  ├── [Decode] 合并上次采样 token + draft tokens
-  ├── Triton kernel 计算 positions 和 seq_lens
-  └── 返回 InputBatch（所有 GPU tensor 就绪）
-```
-
-V2 runner 中对应方法是 `vllm/v1/worker/gpu/model_runner.py:697` 的
-`prepare_inputs()`，结构更模块化，`InputBatch` 也位于
-`vllm/v1/worker/gpu/input_batch.py:36`。
-
-### Attention Metadata
-
-```
-默认 runner:
-  ├── 从 InputBatch / block_table 读取 block tables
-  ├── 计算 slot mappings、query_start_loc、seq_lens 等
-  └── 构建 attention metadata（FlashAttention/FlashInfer 等后端格式）
-
-V2 runner:
-  └── model_state.prepare_attn() 负责同类信息的模块化准备
-```
-
----
-
-## 8. Stage 7：模型前向推理
-
-**文件**: `vllm/v1/worker/gpu_model_runner.py`
-
-```
-execute_model() 继续
-  │
-  ├── [FULL CUDA Graph] → cudagraph_manager.run_fullgraph() → graph.replay()
-  │
-  ├── [Eager / PIECEWISE] → model(**model_inputs)
-  │     │
-  │     ├── Embedding lookup（input_ids → hidden_states）
-  │     ├── [多模态] 注入 vision/audio embeddings 到对应位置
-  │     │
-  │     ├── N × TransformerLayer:
-  │     │     ├── RMSNorm
-  │     │     ├── Self-Attention（PagedAttention，读写 KV cache）
-  │     │     ├── RMSNorm
-  │     │     └── FFN / MoE
-  │     │
-  │     └── Final RMSNorm → Linear → logits（或 hidden_states）
-  │
-  └── 存储 hidden_states 和 logits 到 execute_model_state
-```
-
-**关键**：`execute_model()` 执行模型前向并准备 hidden_states / logits 等中间状态，但不做最终采样；
-grammar bitmask 需要在 logits 产生之后、采样之前应用，因此采样在后续 `sample_tokens()` 中进行。
-
----
-
-## 9. Stage 8：采样
-
-**默认文件**: `vllm/v1/worker/gpu_model_runner.py:4140`
-
-```
-EngineCore.step() 中:
-  execute_model() → 前向推理并暂存 hidden_states / logits（不采样）
-  get_grammar_bitmask() → 生成结构化输出 bitmask
-  sample_tokens(grammar_output) → 实际采样
-```
-
-### sample_tokens()
-
-```
-sample_tokens(grammar_output) (行 4140)
-  │
-  ├── 从 execute_model_state 取出 logits
-  │
-  ├── [结构化输出] apply_grammar_bitmask() → 将不允许的 token 设为 -inf
-  │     (v1/structured_output/utils.py:44)
-  │
-  ├── _sample(logits, ...) → 调用 Sampler
-  │     (gpu_model_runner.py:3329 → v1/sample/sampler.py:68)
-  │     │
-  │     ├── 默认 Sampler.forward() / apply_logits_processors():
-  │     │     ├── logit_bias / allowed_token_ids
-  │     │     ├── frequency / presence / repetition penalty
-  │     │     ├── bad words masking
-  │     │     ├── temperature 缩放
-  │     │     ├── min-p / top-k / top-p 过滤
-  │     │     └── 返回处理后的 logits
-  │     │
-  │     └── top-k/top-p sampler 或 greedy path
-  │           （V2 runner 中为 v1/worker/gpu/sample/sampler.py:57，
-  │            参数处理入口为 apply_sampling_params()，并使用 gumbel_sample）
-  │
-  ├── _update_states_after_model_execute() → 更新 GPU 侧请求状态
-  │
-  └── [Speculative Decoding] propose_draft_token_ids()
-        → 用 draft model 生成候选 token（如果启用）
-```
-
----
-
-## 10. Stage 9：调度器更新状态
-
-### update_from_output()
-
-**文件**: `vllm/v1/core/sched/scheduler.py:1303`
-
-`EngineCore.step()` 拿到 model output 后调用：
-
-```
-update_from_output(scheduler_output, model_output) (行 1303)
-  │
-  ├── 遍历所有被调度的请求：
-  │     │
-  │     ├── [Spec Decoding] 计算被拒绝的 draft tokens，回退 num_computed_tokens
-  │     │
-  │     ├── _update_request_with_output() (行 1635)
-  │     │     ├── request.append_output_token_ids(token)
-  │     │     └── check_stop() → 检查 EOS / max_tokens / stop tokens
-  │     │           (sched/utils.py:94)
-  │     │
-  │     ├── [结构化输出] grammar.accept_tokens() 推进状态机
-  │     │
-  │     └── 如果 stopped:
-  │           ├── _handle_stopped_request() (行 1592)
-  │           │     └── 释放 KV cache、移出 running 列表
-  │           └── 创建 EngineCoreOutput
-  │                 ├── new_token_ids: [int]
-  │                 ├── finish_reason
-  │                 ├── logprobs
-  │                 └── prefill_stats
-  │
-  └── 返回 EngineCoreOutputs → 放入 output queue → ZMQ 发回 API 进程
-```
-
-**如果请求未完成**，下一轮 `schedule()` 的 Phase 1 会继续处理它（此时 num_computed_tokens 已增加，只需计算 1 个新 decode token）。
-
----
-
-## 11. Stage 10：输出处理与反分词
+## 7. Stage 10：输出处理与反分词
 
 ### OutputProcessor
 
@@ -1131,7 +1076,7 @@ GPUWorker            Scheduler              EngineCoreProc             AsyncMPCl
 
 ---
 
-## 12. Stage 11：流式返回
+## 8. Stage 11：流式返回
 
 ### AsyncLLM.generate() 的输出循环
 
