@@ -95,7 +95,7 @@ body {
 }
 .nav .badge {
   display: inline-block;
-  width: 18px; height: 18px;
+  min-width: 18px; height: 18px;
   border-radius: 4px;
   text-align: center;
   line-height: 18px;
@@ -103,6 +103,7 @@ body {
   font-weight: 600;
   margin-right: 6px;
   vertical-align: middle;
+  padding: 0 3px;
 }
 .badge-api { background: rgba(88,166,255,0.15); color: var(--accent-api); }
 .badge-engine { background: rgba(63,185,80,0.15); color: var(--accent-engine); }
@@ -521,9 +522,9 @@ body {
   <a href="#stage9"><span class="badge badge-engine">9</span>调度器更新</a>
   <a href="#stage10-11"><span class="badge badge-return">10-11</span>输出处理 &amp; 流式返回</a>
   <div class="nav-group">附录</div>
-  <a href="#crosscut"><span class="badge badge-cross">&#times;</span>横切关注点</a>
-  <a href="#dataflow">数据对象流转</a>
   <a href="#fullseq">完整时序图</a>
+  <a href="#dataflow">数据对象流转</a>
+  <a href="#crosscut">横切关注点</a>
 </nav>
 
 <!-- Main Content -->
@@ -687,9 +688,7 @@ sequenceDiagram
   <div class="diagram-title">Chat Request 渲染调用栈</div>
   <div class="diagram-box">
     <div class="callstack"><span class="fn-api">OpenAIServingChat.create_chat_completion()</span>
-  <span class="comment">│</span>
   <span class="comment">├─</span> tokenizer / reasoning_parser 初始化
-  <span class="comment">│</span>
   <span class="comment">├─</span> <span class="fn-api">render_chat_request(request)</span>
   <span class="comment">│  ├─</span> <span class="fn-api">_check_model(request)</span>
   <span class="comment">│  └─</span> <span class="fn-render">openai_serving_render.render_chat(request)</span>
@@ -697,7 +696,6 @@ sequenceDiagram
   <span class="comment">│     └─</span> <span class="fn-render">preprocess_chat(...)</span>
   <span class="comment">│        ├─</span> 构造 ChatParams
   <span class="comment">│        └─</span> <span class="fn-render">renderer.render_chat_async(...)</span>
-  <span class="comment">│           │</span>
   <span class="comment">│           ├─</span> <span style="color:#79c0ff;font-weight:600">HfRenderer.render_messages_async()</span>
   <span class="comment">│           │  ├─</span> parse_chat_messages_async()
   <span class="comment">│           │  │  <span class="comment">├─ 规范化 OpenAI message content</span>
@@ -707,10 +705,8 @@ sequenceDiagram
   <span class="comment">│           │  │  <span class="comment">└─ 输出 mm_uuids</span>
   <span class="comment">│           │  ├─</span> <span class="fn-render">safe_apply_chat_template()</span>
   <span class="comment">│           │  └─</span> prompt dict (prompt + mm_data)
-  <span class="comment">│           │</span>
   <span class="comment">│           ├─</span> <span style="color:#7ee787;font-weight:600">BaseRenderer.tokenize_prompts()</span>
   <span class="comment">│           │  └─</span> tokenizer.encode()
-  <span class="comment">│           │</span>
   <span class="comment">│           └─</span> <span style="color:#7ee787;font-weight:600">BaseRenderer.process_for_engine_async()</span>
   <span class="comment">│              ├─</span> 无 MM: <span class="fn-render">tokens_input(prompt_token_ids)</span>
   <span class="comment">│              └─</span> 有 MM: <span class="fn-mm">_process_multimodal_async()</span>
@@ -722,7 +718,6 @@ sequenceDiagram
   <span class="comment">│                 │  ├─</span> _maybe_apply_prompt_updates()
   <span class="comment">│                 │  └─</span> mm_input(...)
   <span class="comment">│                 └─</span> MultiModalInput
-  <span class="comment">│</span>
   <span class="comment">├─</span> 得到 conversation, engine_inputs
   <span class="comment">├─</span> request.to_sampling_params()
   <span class="comment">└─</span> <span class="fn-api">engine_client.generate(...)</span></div>
@@ -1056,13 +1051,11 @@ sequenceDiagram
     <div>
       <div class="diagram-title">Stage 6: Worker 输入准备</div>
       <div class="callstack"><span class="fn-worker">execute_model(scheduler_output)</span>
-  <span class="comment">│</span>
   <span class="comment">├─</span> <span class="fn-worker">_update_states()</span>
   <span class="comment">│  ├─</span> 移除 finished 请求的 cached state
   <span class="comment">│  ├─</span> 释放 encoder cache
   <span class="comment">│  ├─</span> 写入 new / resumed / running 状态
   <span class="comment">│  └─</span> 更新 block table, 采样元数据
-  <span class="comment">│</span>
   <span class="comment">└─</span> <span class="fn-worker">_prepare_inputs()</span>
      <span class="comment">├─</span> 排序 (decode 在前, prefill 在后)
      <span class="comment">├─</span> 构建 idx_mapping
@@ -1074,22 +1067,16 @@ sequenceDiagram
     <div>
       <div class="diagram-title">Stage 7: 模型前向推理</div>
       <div class="callstack"><span class="fn-worker">execute_model() 继续</span>
-  <span class="comment">│</span>
   <span class="comment">├─</span> [FULL CUDA Graph] → <span class="fn-worker">cudagraph_manager.run_fullgraph()</span>
-  <span class="comment">│</span>
   <span class="comment">├─</span> [Eager / PIECEWISE] → <span class="fn-worker">model(**model_inputs)</span>
-  <span class="comment">│  │</span>
   <span class="comment">│  ├─</span> Embedding lookup
   <span class="comment">│  ├─</span> [多模态] 注入 vision/audio embeddings
-  <span class="comment">│  │</span>
   <span class="comment">│  ├─</span> <span style="color:var(--accent-cyan);font-weight:600">N × TransformerLayer:</span>
   <span class="comment">│  │  ├─</span> RMSNorm
   <span class="comment">│  │  ├─</span> Self-Attention (PagedAttention)
   <span class="comment">│  │  ├─</span> RMSNorm
   <span class="comment">│  │  └─</span> FFN / MoE
-  <span class="comment">│  │</span>
   <span class="comment">│  └─</span> Final RMSNorm → Linear → logits
-  <span class="comment">│</span>
   <span class="comment">└─</span> 存储 hidden_states / logits</div>
     </div>
   </div>
@@ -1100,7 +1087,6 @@ sequenceDiagram
   <span class="fn-engine">execute_model()</span> → 暂存 logits（不采样）
   <span class="fn-engine">get_grammar_bitmask()</span> → 结构化输出 mask
   <span class="fn-sampler">sample_tokens(grammar_output)</span>
-  <span class="comment">  │</span>
   <span class="comment">  ├─</span> 从 state 取出 logits
   <span class="comment">  ├─</span> <span class="fn-sampler">apply_grammar_bitmask()</span> → 不允许 token → -inf
   <span class="comment">  ├─</span> <span class="fn-sampler">_sample(logits)</span>
@@ -1110,7 +1096,6 @@ sequenceDiagram
   <span class="comment">  │     ├─</span> temperature 缩放
   <span class="comment">  │     ├─</span> min-p / top-k / top-p 过滤
   <span class="comment">  │     └─</span> top-k/top-p sampler / greedy
-  <span class="comment">  │</span>
   <span class="comment">  ├─</span> _update_states_after_model_execute()
   <span class="comment">  └─</span> [Spec Decoding] propose_draft_token_ids()</div>
   </div>
@@ -1129,19 +1114,14 @@ sequenceDiagram
 
   <div class="diagram-box">
     <div class="callstack"><span class="fn-engine">update_from_output(scheduler_output, model_output)</span>
-  <span class="comment">│</span>
   <span class="comment">├─</span> 遍历所有被调度的请求：
-  <span class="comment">│</span>
   <span class="comment">│  ├─</span> [Spec Decoding] 计算被拒绝的 draft tokens
-  <span class="comment">│  │</span>
   <span class="comment">│  ├─</span> <span class="fn-engine">_update_request_with_output()</span>
   <span class="comment">│  │  ├─</span> request.append_output_token_ids(token)
   <span class="comment">│  │  └─</span> check_stop()
   <span class="comment">│  │     ├─</span> EOS / max_tokens
   <span class="comment">│  │     └─</span> stop tokens
-  <span class="comment">│  │</span>
   <span class="comment">│  ├─</span> [结构化输出] grammar.accept_tokens()
-  <span class="comment">│  │</span>
   <span class="comment">│  └─</span> 如果 stopped:
   <span class="comment">│     ├─</span> <span class="fn-engine">_handle_stopped_request()</span>
   <span class="comment">│     │  └─</span> 释放 KV cache、移出 running
@@ -1149,7 +1129,6 @@ sequenceDiagram
   <span class="comment">│        ├─</span> new_token_ids: [int]
   <span class="comment">│        ├─</span> finish_reason
   <span class="comment">│        └─</span> logprobs
-  <span class="comment">│</span>
   <span class="comment">└─</span> 返回 EngineCoreOutputs → output_queue → ZMQ → API</div>
   </div>
 
@@ -1208,32 +1187,26 @@ sequenceDiagram
     <div>
       <div class="diagram-title">OutputProcessor 处理流</div>
       <div class="callstack"><span class="fn-output">process_outputs(engine_core_outputs)</span>
-  <span class="comment">│</span>
   <span class="comment">├─</span> <span class="fn-output">Detokenizer.update()</span>
   <span class="comment">│  ├─</span> 增量解码 token → 文本
   <span class="comment">│  │  (FastIncrementalDetokenizer: Rust)
   <span class="comment">│  └─</span> 检查 stop strings
-  <span class="comment">│</span>
   <span class="comment">├─</span> LogprobsProcessor.update()
-  <span class="comment">│</span>
   <span class="comment">├─</span> <span class="fn-output">RequestState.make_request_output()</span>
   <span class="comment">│  ├─</span> stream_interval 控制
   <span class="comment">│  └─</span> 创建 RequestOutput
-  <span class="comment">│</span>
   <span class="comment">└─</span> 放入 per-request collector
   <span class="comment">   (DELTA 模式: 聚合输出)</span></div>
     </div>
     <div>
       <div class="diagram-title">SSE 流式响应</div>
       <div class="callstack"><span class="fn-api">chat_completion_stream_generator()</span>
-  <span class="comment">│</span>
   <span class="comment">├─</span> for request_output in result_generator:
   <span class="comment">│  ├─</span> 构建 ChatCompletionStreamResponse
   <span class="comment">│  │  ├─</span> delta.content (增量文本)
   <span class="comment">│  │  ├─</span> delta.reasoning_content
   <span class="comment">│  │  └─</span> usage 信息
   <span class="comment">│  └─</span> yield SSE: "data: {json}\n\n"
-  <span class="comment">│</span>
   <span class="comment">└─</span> yield "data: [DONE]\n\n"</div>
 
       <div style="margin-top:16px">
@@ -1254,9 +1227,116 @@ sequenceDiagram
   </div>
 </section>
 
+<!-- ═══════ FULL SEQUENCE ═══════ -->
+<section class="section" id="fullseq">
+  <div class="section-label" style="color:var(--text-muted)">Appendix</div>
+  <div class="section-title">压缩完整时序图</div>
+
+  <div class="diagram-box mermaid-container">
+    <pre class="mermaid">
+sequenceDiagram
+    participant C as Client
+    participant API as API Server
+    participant A as AsyncLLM
+    participant E as EngineCore
+    participant S as Scheduler
+    participant W as GPUWorker
+
+    C->>API: POST /v1/chat/completions
+    Note right of API: Stage 1: API 接收与解析<br/>Stage 2: 渲染与分词<br/>Stage 3: 多模态处理
+    API->>A: generate()
+    Note right of A: Stage 4: 提交到引擎<br/>├ InputProcessor<br/>├ OutputProcessor.add<br/>└ ZMQ send
+
+    A->>E: ZMQ: ADD
+    E->>S: add_request() → waiting
+
+    rect rgba(63, 185, 80, 0.05)
+    Note over S,W: ── iteration loop (Stage 5-9) ──
+    E->>S: schedule()
+    Note right of S: Phase 1: RUNNING<br/>Phase 2: WAITING → RUNNING
+    S-->>E: SchedulerOutput
+    E->>W: execute_model()
+    Note right of W: Stage 6: prepare inputs<br/>Stage 7: model forward
+    W-->>E: hidden_states
+    E->>W: sample_tokens()
+    Note right of W: Stage 8: grammar + sample
+    W-->>E: sampled ids
+    E->>S: update_from_output()
+    Note right of S: Stage 9: append + stop
+    end
+
+    E->>A: ZMQ PUSH EngineCoreOutputs
+    Note right of A: Stage 10: detokenize<br/>+ logprobs + stop strings
+    A-->>API: yield RequestOutput
+    Note right of API: Stage 11: SSE
+    API-->>C: data: {...}
+
+    Note over S,W: 重复 iteration 直到 finished
+    API-->>C: data: [DONE]
+    </pre>
+  </div>
+</section>
+
+<!-- ═══════ DATA FLOW ═══════ -->
+<section class="section" id="dataflow">
+  <div class="section-label" style="color:var(--text-muted)">Appendix</div>
+  <div class="section-title">关键数据对象流转</div>
+
+  <div class="diagram-box mermaid-container">
+    <pre class="mermaid">
+flowchart TD
+    A["<b>ChatCompletionRequest</b><br/>messages, temperature, max_tokens"]
+    B["<b>prompt_token_ids</b><br/>list[int] + mm_kwargs"]
+    C["<b>EngineInput</b><br/>token / multimodal / embeds"]
+    D["<b>EngineCoreRequest</b><br/>prompt + SamplingParams + mm_features"]
+    E["<b>Request</b><br/>num_computed, output_ids, status, kv_blocks"]
+    F["<b>SchedulerOutput</b><br/>scheduled reqs, tokens, block_ids"]
+    G["<b>InputBatch</b><br/>input_ids, positions, seq_lens (GPU)"]
+    H["<b>Hidden States</b><br/>GPU tensor"]
+    I["<b>Sampled Token IDs</b><br/>GPU"]
+    J["<b>EngineCoreOutput</b><br/>new_token_ids, finish_reason, logprobs"]
+    K["<b>RequestOutput</b><br/>text, token_ids, logprobs, finished"]
+    L["<b>SSE / JSON Response</b>"]
+
+    A -->|render + tokenize| B
+    B -->|process_for_engine| C
+    C -->|InputProcessor| D
+    D -.->|<b>ZMQ IPC</b>| E
+    E -->|schedule| F
+    F -->|prepare inputs| G
+    G -->|model forward| H
+    H -->|sample| I
+    I -->|update_from_output| J
+    J -.->|<b>ZMQ IPC</b>| K
+    K -->|SSE stream| L
+
+    style A fill:#1c2128,stroke:#58a6ff,color:#e6edf3
+    style B fill:#1c2128,stroke:#58a6ff,color:#e6edf3
+    style C fill:#1c2128,stroke:#58a6ff,color:#e6edf3
+    style D fill:#1c2128,stroke:#58a6ff,color:#e6edf3
+    style E fill:#1c2128,stroke:#3fb950,color:#e6edf3
+    style F fill:#1c2128,stroke:#3fb950,color:#e6edf3
+    style G fill:#1c2128,stroke:#f0883e,color:#e6edf3
+    style H fill:#1c2128,stroke:#f0883e,color:#e6edf3
+    style I fill:#1c2128,stroke:#f0883e,color:#e6edf3
+    style J fill:#1c2128,stroke:#3fb950,color:#e6edf3
+    style K fill:#1c2128,stroke:#bc8cff,color:#e6edf3
+    style L fill:#1c2128,stroke:#bc8cff,color:#e6edf3
+    </pre>
+  </div>
+
+  <div class="legend" style="justify-content:center">
+    <div class="legend-item"><div class="legend-dot" style="background:var(--accent-api)"></div> API Server</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--accent-engine)"></div> Engine Core</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--accent-worker)"></div> GPU Worker</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--accent-purple)"></div> Output</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--accent-ipc)"></div> ZMQ IPC</div>
+  </div>
+</section>
+
 <!-- ═══════ CROSS-CUTTING ═══════ -->
 <section class="section" id="crosscut">
-  <div class="section-label" style="color:var(--accent-ipc)">Cross-Cutting</div>
+  <div class="section-label" style="color:var(--text-muted)">Appendix</div>
   <div class="section-title">横切关注点</div>
 
   <div class="two-col">
@@ -1327,115 +1407,6 @@ sequenceDiagram
       </div>
     </div>
   </div>
-</section>
-
-<!-- ═══════ DATA FLOW ═══════ -->
-<section class="section" id="dataflow">
-  <div class="section-label" style="color:var(--text-muted)">Appendix</div>
-  <div class="section-title">关键数据对象流转</div>
-
-  <div class="diagram-box mermaid-container">
-    <pre class="mermaid">
-flowchart TD
-    A["<b>ChatCompletionRequest</b><br/>messages, temperature, max_tokens"]
-    B["<b>prompt_token_ids</b><br/>list[int] + mm_kwargs"]
-    C["<b>EngineInput</b><br/>token / multimodal / embeds"]
-    D["<b>EngineCoreRequest</b><br/>prompt + SamplingParams + mm_features"]
-    E["<b>Request</b><br/>num_computed, output_ids, status, kv_blocks"]
-    F["<b>SchedulerOutput</b><br/>scheduled reqs, tokens, block_ids"]
-    G["<b>InputBatch</b><br/>input_ids, positions, seq_lens (GPU)"]
-    H["<b>Hidden States</b><br/>GPU tensor"]
-    I["<b>Sampled Token IDs</b><br/>GPU"]
-    J["<b>EngineCoreOutput</b><br/>new_token_ids, finish_reason, logprobs"]
-    K["<b>RequestOutput</b><br/>text, token_ids, logprobs, finished"]
-    L["<b>SSE / JSON Response</b>"]
-
-    A -->|render + tokenize| B
-    B -->|process_for_engine| C
-    C -->|InputProcessor| D
-    D -.->|<b>ZMQ IPC</b>| E
-    E -->|schedule| F
-    F -->|prepare inputs| G
-    G -->|model forward| H
-    H -->|sample| I
-    I -->|update_from_output| J
-    J -.->|<b>ZMQ IPC</b>| K
-    K -->|SSE stream| L
-
-    style A fill:#1c2128,stroke:#58a6ff,color:#e6edf3
-    style B fill:#1c2128,stroke:#58a6ff,color:#e6edf3
-    style C fill:#1c2128,stroke:#58a6ff,color:#e6edf3
-    style D fill:#1c2128,stroke:#58a6ff,color:#e6edf3
-    style E fill:#1c2128,stroke:#3fb950,color:#e6edf3
-    style F fill:#1c2128,stroke:#3fb950,color:#e6edf3
-    style G fill:#1c2128,stroke:#f0883e,color:#e6edf3
-    style H fill:#1c2128,stroke:#f0883e,color:#e6edf3
-    style I fill:#1c2128,stroke:#f0883e,color:#e6edf3
-    style J fill:#1c2128,stroke:#3fb950,color:#e6edf3
-    style K fill:#1c2128,stroke:#bc8cff,color:#e6edf3
-    style L fill:#1c2128,stroke:#bc8cff,color:#e6edf3
-    </pre>
-  </div>
-
-  <div class="legend" style="justify-content:center">
-    <div class="legend-item"><div class="legend-dot" style="background:var(--accent-api)"></div> API Server</div>
-    <div class="legend-item"><div class="legend-dot" style="background:var(--accent-engine)"></div> Engine Core</div>
-    <div class="legend-item"><div class="legend-dot" style="background:var(--accent-worker)"></div> GPU Worker</div>
-    <div class="legend-item"><div class="legend-dot" style="background:var(--accent-purple)"></div> Output</div>
-    <div class="legend-item"><div class="legend-dot" style="background:var(--accent-ipc)"></div> ZMQ IPC</div>
-  </div>
-</section>
-
-<!-- ═══════ FULL SEQUENCE ═══════ -->
-<section class="section" id="fullseq">
-  <div class="section-label" style="color:var(--text-muted)">Appendix</div>
-  <div class="section-title">压缩完整时序图</div>
-
-  <div class="diagram-box mermaid-container">
-    <pre class="mermaid">
-sequenceDiagram
-    participant C as Client
-    participant API as API Server
-    participant A as AsyncLLM
-    participant E as EngineCore
-    participant S as Scheduler
-    participant W as GPUWorker
-
-    C->>API: POST /v1/chat/completions
-    Note right of API: Stage 1: API 接收与解析<br/>Stage 2: 渲染与分词<br/>Stage 3: 多模态处理
-    API->>A: generate()
-    Note right of A: Stage 4: 提交到引擎<br/>├ InputProcessor<br/>├ OutputProcessor.add<br/>└ ZMQ send
-
-    A->>E: ZMQ: ADD
-    E->>S: add_request() → waiting
-
-    rect rgba(63, 185, 80, 0.05)
-    Note over S,W: ── iteration loop (Stage 5-9) ──
-    E->>S: schedule()
-    Note right of S: Phase 1: RUNNING<br/>Phase 2: WAITING → RUNNING
-    S-->>E: SchedulerOutput
-    E->>W: execute_model()
-    Note right of W: Stage 6: prepare inputs<br/>Stage 7: model forward
-    W-->>E: hidden_states
-    E->>W: sample_tokens()
-    Note right of W: Stage 8: grammar + sample
-    W-->>E: sampled ids
-    E->>S: update_from_output()
-    Note right of S: Stage 9: append + stop
-    end
-
-    E->>A: ZMQ PUSH EngineCoreOutputs
-    Note right of A: Stage 10: detokenize<br/>+ logprobs + stop strings
-    A-->>API: yield RequestOutput
-    Note right of API: Stage 11: SSE
-    API-->>C: data: {...}
-
-    Note over S,W: 重复 iteration 直到 finished
-    API-->>C: data: [DONE]
-    </pre>
-  </div>
-
-  <div class="file-ref">完整代码阅读顺序见 request.md 第 14 节（7 个阶段，33 个文件）</div>
 </section>
 
 </div><!-- end .main -->

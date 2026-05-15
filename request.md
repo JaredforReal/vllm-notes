@@ -1173,231 +1173,9 @@ for request_output in result_generator:    # result_generator = engine_client.ge
 
 ---
 
-## 13. 横切关注点
+## 附录
 
-### 13.1 结构化输出（Structured Output）
-
-贯穿多个阶段：
-
-```
-Stage 1: ChatCompletionRequest.response_format → SamplingParams.structured_outputs
-Stage 4: InputProcessor 创建 StructuredOutputRequest
-Stage 5: Scheduler.add_request() → grammar_init() 异步编译 grammar
-Stage 8: get_grammar_bitmask() → 填充 allowed/disallowed token bitmask
-         apply_grammar_bitmask() → logits 中不允许的 token 设为 -inf
-Stage 9: grammar.accept_tokens() → 推进 grammar 状态机
-```
-
-**文件**: `vllm/v1/structured_output/__init__.py`
-
-支持的后端：xgrammar, guidance, outlines, lm-format-enforcer。
-
-### 13.2 Speculative Decoding
-
-```
-Stage 8: sample_tokens() 结束后 → propose_draft_token_ids()
-         draft model 生成 N 个候选 token
-Stage 5: 下一步 schedule() 时，draft tokens 被计入 num_tokens_with_spec
-Stage 7: 模型一次前向计算验证所有 draft tokens
-Stage 9: update_from_output() 计算接受/拒绝的 draft tokens
-         被拒绝的 tokens → 回退 num_computed_tokens
-```
-
-### 13.3 请求 Abort
-
-随时可能发生（客户端断连、超时等）：
-- API 进程：`generate()` 被 CancelledError 中断 → 调用 `abort()`
-- EngineCore：`_process_aborts_queue()` 在 step 之间处理 abort
-- Worker：完成的请求在下一个 `_update_states()` 中被移除
-
-### 13.4 LoRA
-
-```
-Stage 1: ChatCompletionRequest 中指定 LoRA adapter
-Stage 4: InputProcessor 验证 LoRA 配置
-Stage 5: Scheduler 跟踪 active LoRAs（受 max_loras 约束）
-Stage 6: Worker 加载 LoRA weights 到 GPU
-Stage 8: CUDA Graph 可能需要不同的 graph（按 num_active_loras 特化）
-```
-
-### 13.5 DP / TP / PP 下的 request 路由
-
-本文主线默认画的是“一个 request 进入一个 EngineCore，再调度一组 GPU workers”。分布式部署时，
-这条链路会被并行复制：
-
-- **TP/PP**：一个 EngineCore 调度一组 worker；这些 worker 共同完成同一个模型 forward。
-- **DP**：有多个 EngineCore，每个 DP rank 管一组 worker；前端 `EngineCoreClient` 或外部负载均衡
-  选择把 request 发到哪个 DP rank。
-- **DP Coordinator**：在内部 DP 负载均衡或 MoE 场景中，协调各 EngineCore 的运行状态、队列计数和
-  wave 进度。普通单 DP 读代码时可以先不进入这一层。
-
-这也是 `EngineCoreRequest.client_index` 和 `request_id → engine` 路由表存在的原因：多 API server
-和多 EngineCore 时，输出必须回到发起该 request 的 frontend，并且 abort 必须发到持有该 request 的
-EngineCore。
-
----
-
-## 14. 代码阅读顺序
-
-### 第一阶段：API 入口（一个 HTTP 请求怎么进来的）
-
-| 顺序 | 文件 | 关键方法 | 说明 |
-|------|------|----------|------|
-| 1 | `entrypoints/openai/api_server.py` | `run_server_worker()` (行 681) | 服务器启动 |
-| 2 | `entrypoints/openai/chat_completion/api_router.py` | `create_chat_completion()` (行 53) | POST handler |
-| 3 | `entrypoints/openai/chat_completion/protocol.py` | `ChatCompletionRequest` (行 150) | 请求结构 |
-| 4 | `entrypoints/openai/chat_completion/serving.py` | `create_chat_completion()` (行 229) | 编排逻辑 |
-
-### 第二阶段：渲染与分词（prompt 怎么变成 token IDs）
-
-| 顺序 | 文件 | 关键方法 | 说明 |
-|------|------|----------|------|
-| 5 | `entrypoints/serve/render/serving.py` | `OpenAIServingRender.render_chat()` | 请求预处理服务层 |
-| 6 | `entrypoints/serve/render/serving.py` | `preprocess_chat()` | 构造 ChatParams 并调用 renderer |
-| 7 | `renderers/hf.py` | `render_messages_async()` | HF chat template + OpenAI message 解析 |
-| 8 | `renderers/base.py` | `render_chat_async()` | renderer 主流程 |
-| 9 | `renderers/base.py` | `_tokenize_prompt()` | 分词 |
-| 10 | `renderers/base.py` | `_process_multimodal()` | 多模态处理入口 |
-| 11 | `multimodal/processing/processor.py` | `BaseMultiModalProcessor.apply()` | vLLM 多模态 processor |
-
-### 第三阶段：引擎提交（请求怎么到 EngineCore）
-
-| 顺序 | 文件 | 关键方法 | 说明 |
-|------|------|----------|------|
-| 12 | `v1/engine/async_llm.py` | `generate()` (行 521) | 主入口 |
-| 13 | `v1/engine/async_llm.py` | `add_request()` (行 280) | 处理 + 注册 + 发送 |
-| 14 | `v1/engine/input_processor.py` | `process_inputs()` (行 234) | 输入处理 |
-| 15 | `v1/engine/output_processor.py` | `add_request()` (行 508) | 注册 RequestState |
-| 16 | `v1/engine/core_client.py` | `add_request_async()` (行 1058) | ZMQ 发送 |
-
-### 第四阶段：调度（请求何时被执行）
-
-| 顺序 | 文件 | 关键方法 | 说明 |
-|------|------|----------|------|
-| 17 | `v1/engine/core.py` | `run_busy_loop()` (行 1164) | 核心循环 |
-| 18 | `v1/engine/core.py` | `step()` (行 402) | 单步执行 |
-| 19 | `v1/core/sched/scheduler.py` | `schedule()` (行 352) | 调度算法 |
-| 20 | `v1/core/sched/scheduler.py` | `add_request()` (行 1741) | 加入 waiting |
-| 21 | `v1/request.py` | `Request` (行 55) | 请求对象 |
-
-### 第五阶段：GPU 执行（模型如何处理请求）
-
-| 顺序 | 文件 | 关键方法 | 说明 |
-|------|------|----------|------|
-| 22 | `v1/worker/gpu_model_runner.py` | `execute_model()` (行 3787) | 默认 GPU runner |
-| 23 | `v1/worker/gpu_model_runner.py` | `_prepare_inputs()` (行 1776) | GPU 输入构建 |
-| 24 | `v1/worker/gpu_model_runner.py` | `sample_tokens()` (行 4140) | 采样入口 |
-| 25 | `v1/sample/sampler.py` | `forward()` (行 68) | 默认采样逻辑 |
-| 25.1 | `v1/worker/gpu/model_runner.py` | `execute_model()` (行 955) | V2 runner 可选路径 |
-| 25.2 | `v1/worker/gpu/sample/sampler.py` | `__call__()` (行 57) | V2 采样逻辑 |
-
-### 第六阶段：输出处理（token IDs 怎么变成文本）
-
-| 顺序 | 文件 | 关键方法 | 说明 |
-|------|------|----------|------|
-| 26 | `v1/core/sched/scheduler.py` | `update_from_output()` (行 1303) | 追加 token、检查停止 |
-| 27 | `v1/core/sched/utils.py` | `check_stop()` (行 94) | 停止条件判断 |
-| 28 | `v1/engine/output_processor.py` | `process_outputs()` (行 572) | 反分词 + 构建输出 |
-| 29 | `v1/engine/detokenizer.py` | `update()` (行 95) | 增量反分词 |
-
-### 第七阶段：响应返回（怎么发回给用户）
-
-| 顺序 | 文件 | 关键方法 | 说明 |
-|------|------|----------|------|
-| 30 | `v1/engine/async_llm.py` | `_run_output_handler()` (行 634) | 后台拉取输出 |
-| 31 | `v1/engine/async_llm.py` | `generate()` (行 570) | yield 给上层 |
-| 32 | `entrypoints/openai/chat_completion/serving.py` | `chat_completion_stream_generator()` (行 525) | SSE 流式 |
-| 33 | `entrypoints/openai/chat_completion/serving.py` | `chat_completion_full_generator()` (行 1273) | 完整 JSON |
-
----
-
-## 附录：官方架构页补充的部署视角
-
-官方 Architecture Overview 强调的是进程数量和部署拓扑，可以和本文 request 链路这样对应：
-
-| 组件 | 官方架构视角 | 本文 request 视角 |
-|------|--------------|-------------------|
-| API Server Process | 处理 HTTP、输入处理、流式返回；通过 ZMQ 连接 EngineCore | Stage 1-4 和 Stage 10-11，包含 OpenAI serving、renderer、AsyncLLM output handler |
-| Engine Core Process | 每个 DP rank 一个；运行 scheduler、KV cache 管理、调度 GPU worker | Stage 5 和 Stage 9，重点看 `run_busy_loop()`、`schedule()`、`update_from_output()` |
-| GPU Worker Process | 通常一个 worker 控制一个 GPU；执行模型 forward 并管理 GPU 内存 | Stage 6-8，重点看 `GPUModelRunner.execute_model()` 和 `sample_tokens()` |
-| DP Coordinator | `--data-parallel-size > 1` 时出现；负责 DP rank 间负载均衡，MoE 场景还要协调同步 forward | 本文只在 EngineCoreClient/DP load balancing 和横切关注点中点到，普通单 DP 请求可先忽略 |
-
-进程数量可以用一个粗略公式记住：如果有 `N` 张 GPU、`TP` tensor parallel size、`PP`
-pipeline parallel size、`DP` data parallel size、`A` 个 API server，那么通常有：
-
-```
-API Server:     A，默认常随 DP 扩展
-EngineCore:     DP
-GPU Worker:     N = DP × PP × TP
-DP Coordinator: DP > 1 时通常为 1
-总数:           A + DP + N (+ DP Coordinator)
-```
-
-例如单机 4 GPU、`tp=4` 通常是 `1 API server + 1 EngineCore + 4 GPU workers`；
-`tp=2, dp=4` 的 8 GPU 部署会变成多组 API server / EngineCore / worker，并额外有 DP coordinator。
-这解释了为什么本文的 request 只画“一条 EngineCore 链路”，但实际部署中可能有多个并行的同构链路。
-
-## 附录：关键数据对象流转图
-
-```
-ChatCompletionRequest                   [protocol.py:150]
-    │  (Pydantic model: messages, temperature, max_tokens, ...)
-    │
-    ▼
-render_chat() → prompt_token_ids        [renderers/base.py:969]
-    │  (list[int]: 分词后的 token IDs)
-    │  (+ mm_kwargs / mm_hashes / mm_placeholders 如果有多模态)
-    │
-    ▼
-EngineInput                            [inputs]
-    │  (token / multimodal / embeds 等 typed dict)
-    │
-    ▼
-SamplingParams                          [sampling_params.py]
-    │  (temperature, top_p, max_tokens, stop, logprobs, structured_outputs, ...)
-    │
-    ▼
-EngineCoreRequest                       [v1/engine/__init__.py]
-    │  (prompt_token_ids, sampling_params, mm_features, lora_request, ...)
-    │  (mm_features 由 InputProcessor 从 EngineInput 的多模态字段整理而来)
-    │  ═══ ZMQ IPC ═══
-    ▼
-Request                                 [v1/request.py:55]
-    │  (num_computed_tokens, output_token_ids, status, kv_cache_blocks, ...)
-    │
-    ▼
-SchedulerOutput                         [v1/core/sched/output.py:179]
-    │  (scheduled_new/cached_reqs, num_scheduled_tokens, block_ids)
-    │
-    ▼
-InputBatch (GPU tensors)                [v1/worker/gpu_model_runner.py]
-    │  (input_ids, positions, query_start_loc, seq_lens)
-    │  (V2 runner: v1/worker/gpu/input_batch.py:36)
-    │
-    ▼
-Hidden States (GPU tensor)              [模型输出]
-    │
-    ▼
-Logits → Sampled Token IDs (GPU)        [采样输出]
-    │
-    ▼
-EngineCoreOutput                        [v1/engine/__init__.py]
-    │  (new_token_ids, finish_reason, logprobs)
-    │  ═══ ZMQ IPC ═══
-    ▼
-RequestOutput                           [outputs.py]
-    │  (outputs=[CompletionOutput(text, token_ids, logprobs)], finished, ...)
-    │
-    ▼
-ChatCompletionStreamResponse / ChatCompletionResponse
-    │  [OpenAI 格式]
-    ▼
-HTTP Response (SSE / JSON)
-```
-
----
-
-## 附录：压缩完整时序图
+### 压缩完整时序图
 
 这张图用于最后回顾全链路。细节以正文各 stage 附近的局部时序图和调用栈为准。
 
@@ -1468,3 +1246,149 @@ Client          API Server           AsyncLLM          EngineCore         Schedu
   │<────────────────│                    │                  │                  │                 │
   │ SSE: data: [DONE]                    │                  │                  │                 │
 ```
+
+### 关键数据对象流转图
+
+```
+ChatCompletionRequest                   [protocol.py:150]
+    │  (Pydantic model: messages, temperature, max_tokens, ...)
+    │
+    ▼
+render_chat() → prompt_token_ids        [renderers/base.py:969]
+    │  (list[int]: 分词后的 token IDs)
+    │  (+ mm_kwargs / mm_hashes / mm_placeholders 如果有多模态)
+    │
+    ▼
+EngineInput                            [inputs]
+    │  (token / multimodal / embeds 等 typed dict)
+    │
+    ▼
+SamplingParams                          [sampling_params.py]
+    │  (temperature, top_p, max_tokens, stop, logprobs, structured_outputs, ...)
+    │
+    ▼
+EngineCoreRequest                       [v1/engine/__init__.py]
+    │  (prompt_token_ids, sampling_params, mm_features, lora_request, ...)
+    │  (mm_features 由 InputProcessor 从 EngineInput 的多模态字段整理而来)
+    │  ═══ ZMQ IPC ═══
+    ▼
+Request                                 [v1/request.py:55]
+    │  (num_computed_tokens, output_token_ids, status, kv_cache_blocks, ...)
+    │
+    ▼
+SchedulerOutput                         [v1/core/sched/output.py:179]
+    │  (scheduled_new/cached_reqs, num_scheduled_tokens, block_ids)
+    │
+    ▼
+InputBatch (GPU tensors)                [v1/worker/gpu_model_runner.py]
+    │  (input_ids, positions, query_start_loc, seq_lens)
+    │  (V2 runner: v1/worker/gpu/input_batch.py:36)
+    │
+    ▼
+Hidden States (GPU tensor)              [模型输出]
+    │
+    ▼
+Logits → Sampled Token IDs (GPU)        [采样输出]
+    │
+    ▼
+EngineCoreOutput                        [v1/engine/__init__.py]
+    │  (new_token_ids, finish_reason, logprobs)
+    │  ═══ ZMQ IPC ═══
+    ▼
+RequestOutput                           [outputs.py]
+    │  (outputs=[CompletionOutput(text, token_ids, logprobs)], finished, ...)
+    │
+    ▼
+ChatCompletionStreamResponse / ChatCompletionResponse
+    │  [OpenAI 格式]
+    ▼
+HTTP Response (SSE / JSON)
+```
+
+### 官方架构页补充的部署视角
+
+官方 Architecture Overview 强调的是进程数量和部署拓扑，可以和本文 request 链路这样对应：
+
+| 组件 | 官方架构视角 | 本文 request 视角 |
+|------|--------------|-------------------|
+| API Server Process | 处理 HTTP、输入处理、流式返回；通过 ZMQ 连接 EngineCore | Stage 1-4 和 Stage 10-11，包含 OpenAI serving、renderer、AsyncLLM output handler |
+| Engine Core Process | 每个 DP rank 一个；运行 scheduler、KV cache 管理、调度 GPU worker | Stage 5 和 Stage 9，重点看 `run_busy_loop()`、`schedule()`、`update_from_output()` |
+| GPU Worker Process | 通常一个 worker 控制一个 GPU；执行模型 forward 并管理 GPU 内存 | Stage 6-8，重点看 `GPUModelRunner.execute_model()` 和 `sample_tokens()` |
+| DP Coordinator | `--data-parallel-size > 1` 时出现；负责 DP rank 间负载均衡，MoE 场景还要协调同步 forward | 本文只在 EngineCoreClient/DP load balancing 和横切关注点中点到，普通单 DP 请求可先忽略 |
+
+进程数量可以用一个粗略公式记住：如果有 `N` 张 GPU、`TP` tensor parallel size、`PP`
+pipeline parallel size、`DP` data parallel size、`A` 个 API server，那么通常有：
+
+```
+API Server:     A，默认常随 DP 扩展
+EngineCore:     DP
+GPU Worker:     N = DP × PP × TP
+DP Coordinator: DP > 1 时通常为 1
+总数:           A + DP + N (+ DP Coordinator)
+```
+
+例如单机 4 GPU、`tp=4` 通常是 `1 API server + 1 EngineCore + 4 GPU workers`；
+`tp=2, dp=4` 的 8 GPU 部署会变成多组 API server / EngineCore / worker，并额外有 DP coordinator。
+这解释了为什么本文的 request 只画“一条 EngineCore 链路”，但实际部署中可能有多个并行的同构链路。
+
+### 横切关注点
+
+#### 1. 结构化输出（Structured Output）
+
+贯穿多个阶段：
+
+```
+Stage 1: ChatCompletionRequest.response_format → SamplingParams.structured_outputs
+Stage 4: InputProcessor 创建 StructuredOutputRequest
+Stage 5: Scheduler.add_request() → grammar_init() 异步编译 grammar
+Stage 8: get_grammar_bitmask() → 填充 allowed/disallowed token bitmask
+         apply_grammar_bitmask() → logits 中不允许的 token 设为 -inf
+Stage 9: grammar.accept_tokens() → 推进 grammar 状态机
+```
+
+**文件**: `vllm/v1/structured_output/__init__.py`
+
+支持的后端：xgrammar, guidance, outlines, lm-format-enforcer。
+
+#### 2. Speculative Decoding
+
+```
+Stage 8: sample_tokens() 结束后 → propose_draft_token_ids()
+         draft model 生成 N 个候选 token
+Stage 5: 下一步 schedule() 时，draft tokens 被计入 num_tokens_with_spec
+Stage 7: 模型一次前向计算验证所有 draft tokens
+Stage 9: update_from_output() 计算接受/拒绝的 draft tokens
+         被拒绝的 tokens → 回退 num_computed_tokens
+```
+
+#### 3. 请求 Abort
+
+随时可能发生（客户端断连、超时等）：
+- API 进程：`generate()` 被 CancelledError 中断 → 调用 `abort()`
+- EngineCore：`_process_aborts_queue()` 在 step 之间处理 abort
+- Worker：完成的请求在下一个 `_update_states()` 中被移除
+
+#### 4. LoRA
+
+```
+Stage 1: ChatCompletionRequest 中指定 LoRA adapter
+Stage 4: InputProcessor 验证 LoRA 配置
+Stage 5: Scheduler 跟踪 active LoRAs（受 max_loras 约束）
+Stage 6: Worker 加载 LoRA weights 到 GPU
+Stage 8: CUDA Graph 可能需要不同的 graph（按 num_active_loras 特化）
+```
+
+#### 5. DP / TP / PP 下的 request 路由
+
+本文主线默认画的是“一个 request 进入一个 EngineCore，再调度一组 GPU workers”。分布式部署时，
+这条链路会被并行复制：
+
+- **TP/PP**：一个 EngineCore 调度一组 worker；这些 worker 共同完成同一个模型 forward。
+- **DP**：有多个 EngineCore，每个 DP rank 管一组 worker；前端 `EngineCoreClient` 或外部负载均衡
+  选择把 request 发到哪个 DP rank。
+- **DP Coordinator**：在内部 DP 负载均衡或 MoE 场景中，协调各 EngineCore 的运行状态、队列计数和
+  wave 进度。普通单 DP 读代码时可以先不进入这一层。
+
+这也是 `EngineCoreRequest.client_index` 和 `request_id → engine` 路由表存在的原因：多 API server
+和多 EngineCore 时，输出必须回到发起该 request 的 frontend，并且 abort 必须发到持有该 request 的
+EngineCore。
