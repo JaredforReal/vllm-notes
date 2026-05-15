@@ -514,12 +514,8 @@ body {
   <a href="#stage1"><span class="badge badge-api">1</span>API 接收与解析</a>
   <a href="#stage2-3"><span class="badge badge-api">2-3</span>渲染分词 / 多模态</a>
   <a href="#stage4"><span class="badge badge-api">4</span>提交到引擎</a>
-  <div class="nav-group">Engine Core 进程</div>
-  <a href="#stage5"><span class="badge badge-engine">5</span>调度排队</a>
-  <div class="nav-group">GPU Worker 进程</div>
-  <a href="#stage6-8"><span class="badge badge-worker">6-8</span>GPU 执行</a>
-  <div class="nav-group">状态更新 &amp; 返回</div>
-  <a href="#stage9"><span class="badge badge-engine">9</span>调度器更新</a>
+  <div class="nav-group">EngineCore.step() 编排</div>
+  <a href="#iteration-loop"><span class="badge badge-engine">&#8635;</span>Iteration Loop</a>
   <a href="#stage10-11"><span class="badge badge-return">10-11</span>输出处理 &amp; 流式返回</a>
   <div class="nav-group">附录</div>
   <a href="#fullseq">完整时序图</a>
@@ -572,24 +568,23 @@ body {
 
     <div class="arrow-down"><span class="arrow">&#8595;</span>ZMQ IPC (ROUTER &#8594; DEALER)</div>
 
-    <!-- Engine Core -->
+    <!-- Engine Core — 编排者 -->
     <div class="process-box engine-process">
-      <div class="process-label">Engine Core 进程</div>
+      <div class="process-label">Engine Core 进程 &nbsp;&mdash; step() 编排者</div>
       <div class="stages-row">
-        <div class="stage-chip"><span class="num">5</span> 调度排队</div>
-        <div class="stage-chip"><span class="num">9</span> 调度器更新状态</div>
+        <div class="stage-chip"><span class="num">P1</span> Schedule</div>
+        <div class="stage-chip"><span class="num">P4</span> State Update</div>
       </div>
     </div>
 
-    <div class="arrow-down"><span class="arrow">&#8595;</span>内部调用 (model_executor)</div>
+    <div class="arrow-down"><span class="arrow">&#8595;</span>model_executor 分发到 Worker</div>
 
     <!-- GPU Worker -->
     <div class="process-box worker-process">
-      <div class="process-label">GPU Worker 进程</div>
+      <div class="process-label">GPU Worker 进程 &nbsp;(被 EngineCore 编排)</div>
       <div class="stages-row">
-        <div class="stage-chip"><span class="num">6</span> Worker 输入准备</div>
-        <div class="stage-chip"><span class="num">7</span> 模型前向推理</div>
-        <div class="stage-chip"><span class="num">8</span> 采样</div>
+        <div class="stage-chip"><span class="num">P2</span> 模型执行 (S6-7)</div>
+        <div class="stage-chip"><span class="num">P3</span> GPU 采样 (S8)</div>
       </div>
     </div>
 
@@ -606,10 +601,10 @@ body {
   </div>
 
   <div style="display:flex; justify-content:center; margin-top:20px;">
-    <div class="loop-badge">&#8635; Stage 5-9 在每个 iteration 中重复执行，每步生成一个或多个 token，直到请求完成</div>
+    <div class="loop-badge">&#8635; Phase 1-4 在 EngineCore.step() 中每轮执行，Worker 不自主驱动</div>
   </div>
 
-  <div class="file-ref">阅读路径：先看总图建立进程边界 &rarr; Stage 1-4 理解请求解析 &rarr; Stage 5-11 理解迭代执行与返回</div>
+  <div class="file-ref">阅读路径：总图建立进程边界 &rarr; Stage 1-4 请求解析 &rarr; Iteration Loop 理解 step() 四阶段 &rarr; Stage 10-11 输出返回</div>
 </section>
 
 <!-- ═══════ STAGE 1 ═══════ -->
@@ -826,48 +821,44 @@ sequenceDiagram
   <div class="section-label" style="color:var(--accent-api)">Stage 4</div>
   <div class="section-title">提交到引擎</div>
 
-  <div class="diagram-box mermaid-container">
-    <div class="diagram-title">AsyncLLM 内部架构</div>
-    <pre class="mermaid">
-flowchart TB
-    subgraph api["API Server 进程"]
-        direction TB
-        serving["OpenAI Serving Task"]
-        gen["AsyncLLM.generate()"]
-        add["add_request()"]
-        ip["InputProcessor.process_inputs()"]
-        op["OutputProcessor.add_request()"]
-
-        subgraph bg["后台 task"]
-            oh["_run_output_handler()"]
-            proc["process_outputs()"]
-            det["detokenize + logprobs"]
-            col["collector.put()"]
-        end
-
-        subgraph zmq_out["AsyncMPClient"]
-            zmq_send["ZMQ ROUTER send"]
-            zmq_recv["ZMQ PULL recv"]
-            oq["outputs_queue"]
-        end
-    end
-
-    serving --> gen
-    gen --> add
-    add --> ip
-    add --> op
-    ip --> zmq_send
-    zmq_recv --> oq
-    oq --> oh
-    oh --> proc
-    proc --> det
-    det --> col
-    col -.->|per-request| gen
-
-    style api fill:#161b22,stroke:#30363d,color:#e6edf3
-    style bg fill:#21262d,stroke:#30363d,color:#e6edf3
-    style zmq_out fill:#1c2128,stroke:#30363d,color:#e6edf3
-    </pre>
+  <div class="diagram-title">提交与回收的边界</div>
+  <div class="two-col" style="margin:0">
+    <div class="diagram-box" style="margin:0">
+      <div style="font-size:13px;margin-bottom:8px;color:var(--accent-api);font-weight:600">提交路径 (Request → EngineCore)</div>
+      <div class="callstack"><span class="fn-api">OpenAI serving task</span>
+  <span class="comment">│ engine_client.generate(...)</span>
+  <span class="comment">▼</span>
+  <span class="fn-api">AsyncLLM.generate()</span>
+  <span class="comment">├─</span> <span class="fn-api">add_request()</span>
+  <span class="comment">│  ├─</span> <span class="fn-engine">InputProcessor.process_inputs()</span>
+  <span class="comment">│  │  └─</span> EngineInput → EngineCoreRequest
+  <span class="comment">│  ├─</span> <span class="fn-output">OutputProcessor.add_request()</span>
+  <span class="comment">│  │  └─</span> request_id → RequestState + collector
+  <span class="comment">│  └─</span> <span class="fn-engine">EngineCoreClient.add_request_async()</span>
+  <span class="comment">│     └─</span> ZMQ ROUTER send
+  <span class="comment">├─</span> generate() 不读 ZMQ
+  <span class="comment">│  └─</span> 等待 RequestOutputCollector
+  <span class="comment">└─</span> yield RequestOutput → serving 层</div>
+    </div>
+    <div class="diagram-box" style="margin:0">
+      <div style="font-size:13px;margin-bottom:8px;color:var(--accent-engine);font-weight:600">回收路径 (EngineCore → Request)</div>
+      <div class="callstack"><span class="fn-engine">AsyncLLM output_handler task</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> await engine_core.get_output_async()
+  <span class="comment">│  <──</span> AsyncMPClient.outputs_queue.get()
+  <span class="comment">│      ↑ ZMQ PULL recv EngineCoreOutputs</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> <span class="fn-output">process_outputs()</span>
+  <span class="comment">│  ├─</span> <span class="fn-output">Detokenizer.update()</span> → 增量解码
+  <span class="comment">│  ├─</span> LogprobsProcessor.update()
+  <span class="comment">│  ├─</span> stop strings check
+  <span class="comment">│  └─</span> collector.put(RequestOutput)
+  <span class="comment">│</span>
+  <span class="comment">└─</span> 必要时 abort stop-string 命中请求</div>
+    </div>
+  </div>
+  <div style="font-size:12px;color:var(--text-muted);margin-top:12px;text-align:center">
+    generate() 不直接从 ZMQ 读输出；它只消费 per-request collector，经 OutputProcessor 处理后的结果
   </div>
 
   <div class="diagram-title">队列 / 缓冲一览</div>
@@ -905,6 +896,12 @@ flowchart TB
           <td><code>input_queue</code></td>
           <td>input socket thread</td>
           <td>run_busy_loop()</td>
+        </tr>
+        <tr>
+          <td>Core 进程</td>
+          <td><code>aborts_queue</code></td>
+          <td>输入线程 (ABORT 时写入)</td>
+          <td>step() 后的 _process_aborts_queue()</td>
         </tr>
         <tr>
           <td>Core 进程</td>
@@ -961,220 +958,237 @@ flowchart TB
   </div>
 </section>
 
-<!-- ═══════ STAGE 5 ═══════ -->
-<section class="section" id="stage5">
-  <div class="section-label" style="color:var(--accent-engine)">Stage 5</div>
-  <div class="section-title">调度排队</div>
 
-  <div class="loop-badge" style="margin-bottom:24px">&#8635; 以下时序图展示的是每个 engine iteration 的完整循环</div>
+<!-- ═══════ ITERATION LOOP ═══════ -->
+<section class="section" id="iteration-loop">
+  <div class="section-label" style="color:var(--accent-engine)">EngineCore.step()</div>
+  <div class="section-title">The Iteration Loop</div>
 
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:var(--accent-engine)"></div> EngineCore (CPU)</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--accent-worker)"></div> Worker (GPU)</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--accent-ipc)"></div> 并行重叠</div>
+  </div>
+
+  <div class="loop-badge" style="margin-bottom:24px">&#8635; Phase 1-4 在每次 step() 调用中顺序执行，Worker 不自主驱动</div>
+
+  <!-- step() 总览 -->
+  <div class="diagram-title">EngineCore.step() 四阶段总览</div>
+  <div class="flow-steps" style="max-width:700px;margin-bottom:28px">
+    <div class="flow-step">
+      <div class="step-num" style="background:rgba(63,185,80,0.15);color:var(--accent-engine)">P1</div>
+      <div class="step-content">
+        <div class="step-title">Schedule &nbsp;<span style="font-weight:400;color:var(--text-muted)">(Stage 5)</span></div>
+        <div class="step-desc">Scheduler.schedule() → SchedulerOutput &nbsp;[CPU, EngineCore]</div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="step-num" style="background:rgba(240,136,62,0.15);color:var(--accent-worker)">P2</div>
+      <div class="step-content">
+        <div class="step-title">Model Execution &nbsp;<span style="font-weight:400;color:var(--text-muted)">(Stage 6-7)</span></div>
+        <div class="step-desc">execute_model() → logits 暂存, 返回 None &nbsp;[GPU, Worker, non-blocking]</div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="step-num" style="background:rgba(188,140,255,0.15);color:var(--accent-purple)">P3</div>
+      <div class="step-content">
+        <div class="step-title">Sample &nbsp;<span style="font-weight:400;color:var(--text-muted)">(Stage 8)</span></div>
+        <div class="step-desc">grammar mask (与 P2 并行) → sample_tokens() &nbsp;[GPU, Worker]</div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="step-num" style="background:rgba(63,185,80,0.15);color:var(--accent-engine)">P4</div>
+      <div class="step-content">
+        <div class="step-title">State Update &nbsp;<span style="font-weight:400;color:var(--text-muted)">(Stage 9)</span></div>
+        <div class="step-desc">update_from_output() → append tokens, check stop, free KV &nbsp;[CPU, EngineCore]</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 单轮时序图 -->
+  <div class="diagram-title">单轮执行时序</div>
   <div class="diagram-box mermaid-container">
     <pre class="mermaid">
 sequenceDiagram
-    participant A as AsyncLLM
-    participant M as AsyncMPClient
-    participant E as EngineCore
+    participant EC as EngineCore
     participant S as Scheduler
     participant W as GPUWorker
 
-    Note over A,W: ─── 请求提交 ───
-    A->>M: add_request_async()
-    M->>E: ZMQ ROUTER → ADD
-    Note over E: decode + preprocess<br/>grammar_init()
-    E->>S: add_request() → waiting
+    Note over EC,W: Phase 1: Schedule
+    EC->>S: schedule()
+    Note right of S: RUNNING decode<br/>WAITING → RUNNING<br/>allocate KV blocks
+    S-->>EC: SchedulerOutput
 
-    Note over A,W: ─── 调度 ───
-    E->>S: schedule()
-    Note right of S: Phase 1: RUNNING<br/>Phase 2: WAITING → RUNNING
-    S-->>E: SchedulerOutput
+    Note over EC,W: Phase 2: Model Execution (non-blocking)
+    EC->>W: execute_model(scheduler_output)
+    Note right of W: _update_states()<br/>_prepare_inputs()<br/>model forward → logits
 
-    Note over A,W: ─── 模型执行 ───
-    E->>W: execute_model(scheduler_output)
-    Note right of W: _update_states()<br/>_prepare_inputs()<br/>model forward
-    W-->>E: hidden_states / logits
+    Note over EC: get_grammar_bitmask()<br/>(与 GPU forward 并行)
 
-    Note over A,W: ─── 采样 ───
-    E->>S: get_grammar_bitmask()
-    E->>W: sample_tokens(grammar_mask)
-    Note right of W: grammar mask<br/>logits processors<br/>sample token ids
-    W-->>E: ModelRunnerOutput
+    W-->>EC: future: None (logits 暂存)
+    EC->>EC: future.result() [等待 GPU]
 
-    Note over A,W: ─── 状态更新 ───
-    E->>S: update_from_output()
+    Note over EC,W: Phase 3: Sample
+    EC->>W: sample_tokens(grammar_output)
+    Note right of W: apply grammar mask [GPU]<br/>Sampler: top-k/top-p [GPU]<br/>bookkeeping sync [GPU→CPU]
+    W-->>EC: ModelRunnerOutput
+
+    Note over EC,W: Phase 4: State Update
+    EC->>S: update_from_output()
     Note right of S: append tokens<br/>check stop<br/>free KV if done
-    S-->>E: EngineCoreOutputs
-    E->>E: output_queue.put()
-    E->>M: ZMQ PUSH
-    M->>A: outputs_queue
-    Note over A: process_outputs()<br/>collector.put()
+    S-->>EC: EngineCoreOutputs
     </pre>
   </div>
 
-  <div class="two-col">
-    <div>
-      <div class="diagram-title">EngineCore 输入处理</div>
-      <div class="callstack"><span class="fn-engine">EngineCoreProc.__init__()</span>
-  <span class="comment">├──</span> input_queue = queue.Queue()
-  <span class="comment">├──</span> output_queue = queue.Queue()
-  <span class="comment">├──</span> 启动 <span class="fn-engine">process_input_sockets()</span> 线程
-  <span class="comment">└──</span> 启动 <span class="fn-engine">process_output_sockets()</span> 线程
+  <!-- Phase 1: Schedule -->
+  <div class="diagram-title" style="margin-top:32px;color:var(--accent-engine)">Phase 1: Schedule — Stage 5</div>
 
-<span class="fn-engine">run_busy_loop()</span>
-  <span class="comment">├──</span> _process_input_queue()
+  <div class="diagram-title" style="font-weight:400;font-size:12px">请求到达 EngineCore</div>
+  <div class="diagram-box" style="padding:16px">
+    <div class="callstack"><span class="fn-engine">EngineCoreProc.run_busy_loop()</span> <span class="comment">(行 1164)</span>
+  <span class="comment">├──</span> <span class="fn-engine">_process_input_queue()</span>
   <span class="comment">│   ├──</span> 空闲时阻塞等待 input_queue
-  <span class="comment">│   └──</span> _handle_client_request()
-  <span class="comment">│       ├──</span> ADD → Scheduler.add_request()
+  <span class="comment">│   ├──</span> 有 work 后 drain 当前 input_queue
+  <span class="comment">│   └──</span> <span class="fn-engine">_handle_client_request()</span>
+  <span class="comment">│       ├──</span> ADD → <span class="fn-engine">Scheduler.add_request()</span> → waiting 队列
   <span class="comment">│       ├──</span> ABORT → finish_requests()
-  <span class="comment">│       └──</span> UTILITY → 调 EngineCore 方法
-  <span class="comment">└──</span> _process_engine_step() → step()</div>
-    </div>
-    <div>
-      <div class="diagram-title">Scheduler.schedule() 两阶段</div>
-      <div class="flow-steps">
-        <div class="flow-step">
-          <div class="step-num" style="background:rgba(63,185,80,0.15);color:var(--accent-engine)">P1</div>
-          <div class="step-content">
-            <div class="step-title">调度 RUNNING</div>
-            <div class="step-desc">计算 new tokens → 分配 KV blocks → 内存不足时抢占</div>
-          </div>
-        </div>
-        <div class="flow-step">
-          <div class="step-num" style="background:rgba(63,185,80,0.15);color:var(--accent-engine)">P2</div>
-          <div class="step-content">
-            <div class="step-title">调度 WAITING</div>
-            <div class="step-desc">prefix cache 命中 → 准入控制 → 分配 KV → 移入 running</div>
-          </div>
-        </div>
-      </div>
-    </div>
+  <span class="comment">│       └──</span> UTILITY
+  <span class="comment">└──</span> <span class="fn-engine">_process_engine_step()</span> → step()</div>
   </div>
 
+  <div class="diagram-title" style="font-weight:400;font-size:12px">Scheduler.schedule() 调用栈</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-engine">Scheduler.schedule()</span> <span class="comment">(行 352)</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> <span style="color:var(--accent-engine);font-weight:600">调度 RUNNING</span> <span class="comment">(行 387)</span>
+  <span class="comment">│  ├─</span> 计算 num_new_tokens = num_tokens_with_spec - num_computed_tokens
+  <span class="comment">│  ├─</span> 长预填充分块 (long_prefill_token_threshold)
+  <span class="comment">│  ├─</span> 分配 KV cache blocks
+  <span class="comment">│  └─</span> 内存不足时 → 抢占低优先级请求
+  <span class="comment">│</span>
+  <span class="comment">├─</span> <span style="color:var(--accent-engine);font-weight:600">调度 WAITING</span> <span class="comment">(行 567)</span>
+  <span class="comment">│  ├─</span> 从 waiting 队列取出请求
+  <span class="comment">│  ├─</span> 检查 prefix cache 命中
+  <span class="comment">│  ├─</span> 准入控制 (can_fit_full_sequence)
+  <span class="comment">│  ├─</span> 分配 KV cache blocks
+  <span class="comment">│  └─</span> 移入 running 列表
+  <span class="comment">│</span>
+  <span class="comment">└─</span> 返回 <span class="fn-engine">SchedulerOutput</span>
+  <span class="comment">   ├─</span> num_scheduled_tokens: {req_id: int}
+  <span class="comment">   ├─</span> scheduled_new_reqs / scheduled_cached_reqs
+  <span class="comment">   ├─</span> block_ids 映射
+  <span class="comment">   └─</span> finished_req_ids</div>
+  </div>
   <div class="file-ref">
-    <span class="path">v1/engine/core.py</span>:1164 busy_loop &nbsp;|&nbsp;
+    <span class="path">v1/engine/core.py</span>:402 step &nbsp;|&nbsp;
     <span class="path">v1/core/sched/scheduler.py</span>:352 schedule
   </div>
-</section>
 
-<!-- ═══════ STAGE 6-8 ═══════ -->
-<section class="section" id="stage6-8">
-  <div class="section-label" style="color:var(--accent-worker)">Stage 6-8</div>
-  <div class="section-title">GPU 执行：准备 → 推理 → 采样</div>
+  <!-- Phase 2: Model Execution -->
+  <div style="height:1px;background:var(--border);margin:40px 0"></div>
+  <div class="diagram-title" style="color:var(--accent-worker)">Phase 2: Model Execution — Stage 6-7</div>
 
-  <div class="diagram-title">Worker / ModelRunner / Model 三层架构</div>
-  <div class="diagram-box">
-    <div class="layer-stack">
-      <div class="layer" style="background:rgba(240,136,62,0.08);border-left:3px solid var(--accent-worker)">
-        <div class="layer-name" style="color:var(--accent-worker)">Worker</div>
-        <div class="layer-desc">绑定 rank / local_rank，管理 accelerator device，初始化分布式通信和 GPU 内存</div>
-        <div class="layer-contains">持有 model runner</div>
-      </div>
-      <div class="layer" style="background:rgba(188,140,255,0.08);border-left:3px solid var(--accent-purple)">
-        <div class="layer-name" style="color:var(--accent-purple)">ModelRunner</div>
-        <div class="layer-desc">根据 SchedulerOutput 准备 GPU tensors，管理 CUDA Graph / attention metadata / InputBatch</div>
-        <div class="layer-contains">调用 model forward，执行 logits 处理与采样</div>
-      </div>
-      <div class="layer" style="background:rgba(57,210,192,0.08);border-left:3px solid var(--accent-cyan)">
-        <div class="layer-name" style="color:var(--accent-cyan)">Model (torch.nn.Module)</div>
-        <div class="layer-desc">Embedding, Attention (PagedAttention), MLP/MoE, LM Head</div>
-      </div>
-    </div>
+  <div class="diagram-title" style="font-weight:400;font-size:12px">Worker / ModelRunner / Model 三层架构</div>
+  <div class="diagram-box" style="padding:16px">
+    <div class="callstack"><span style="color:var(--accent-worker);font-weight:600">Worker</span> <span class="comment">(gpu_worker.py)</span>
+  <span class="comment">├─</span> 绑定 rank / local_rank, 管理 accelerator device
+  <span class="comment">├─</span> 初始化分布式通信和 GPU 内存
+  <span class="comment">└─</span> 持有 <span style="color:var(--accent-purple);font-weight:600">ModelRunner</span>
+
+<span style="color:var(--accent-purple);font-weight:600">GPUModelRunner</span> <span class="comment">(gpu_model_runner.py)</span>
+  <span class="comment">├─</span> 持久化批次状态: InputBatch (所有活跃请求的 GPU tensor 汇总)
+  <span class="comment">├─</span> 接收 SchedulerOutput → 更新 InputBatch
+  <span class="comment">├─</span> _prepare_inputs() → 构建 GPU 输入 (positions, attn metadata)
+  <span class="comment">├─</span> model forward → logits → 暂存到 execute_model_state
+  <span class="comment">└─</span> 后续被 sample_tokens() 调用: grammar + 采样 + bookkeeping
+
+<span style="color:var(--accent-cyan);font-weight:600">Model</span> <span class="comment">(torch.nn.Module)</span>
+  <span class="comment">├─</span> Embedding → N × TransformerLayer → logits
+  <span class="comment">└─</span> 每层: RMSNorm → Attention (PagedAttention) → RMSNorm → FFN/MoE</div>
   </div>
 
-  <div class="two-col">
-    <div>
-      <div class="diagram-title">Stage 6: Worker 输入准备</div>
-      <div class="callstack"><span class="fn-worker">execute_model(scheduler_output)</span>
-  <span class="comment">├─</span> <span class="fn-worker">_update_states()</span>
-  <span class="comment">│  ├─</span> 移除 finished 请求的 cached state
-  <span class="comment">│  ├─</span> 释放 encoder cache
+  <div class="diagram-title" style="font-weight:400;font-size:12px">execute_model() 调用栈</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-worker">GPUModelRunner.execute_model(scheduler_output)</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> <span class="fn-worker">_update_states()</span> <span class="comment">(行 1061)</span>
+  <span class="comment">│  ├─</span> 移除 finished 请求的 cached state / InputBatch 条目
+  <span class="comment">│  ├─</span> 释放 encoder cache, 处理新 KV blocks
   <span class="comment">│  ├─</span> 写入 new / resumed / running 状态
-  <span class="comment">│  └─</span> 更新 block table, 采样元数据
-  <span class="comment">└─</span> <span class="fn-worker">_prepare_inputs()</span>
-     <span class="comment">├─</span> 排序 (decode 在前, prefill 在后)
-     <span class="comment">├─</span> 构建 idx_mapping
-     <span class="comment">├─</span> 计算 query_start_loc (cumsum)
-     <span class="comment">├─</span> [Prefill] Triton kernel 填 input_ids
-     <span class="comment">├─</span> [Decode] 合并上次 token + drafts
-     <span class="comment">└─</span> → InputBatch (GPU tensors 就绪)</div>
-    </div>
-    <div>
-      <div class="diagram-title">Stage 7: 模型前向推理</div>
-      <div class="callstack"><span class="fn-worker">execute_model() 继续</span>
-  <span class="comment">├─</span> [FULL CUDA Graph] → <span class="fn-worker">cudagraph_manager.run_fullgraph()</span>
-  <span class="comment">├─</span> [Eager / PIECEWISE] → <span class="fn-worker">model(**model_inputs)</span>
-  <span class="comment">│  ├─</span> Embedding lookup
-  <span class="comment">│  ├─</span> [多模态] 注入 vision/audio embeddings
-  <span class="comment">│  ├─</span> <span style="color:var(--accent-cyan);font-weight:600">N × TransformerLayer:</span>
-  <span class="comment">│  │  ├─</span> RMSNorm
-  <span class="comment">│  │  ├─</span> Self-Attention (PagedAttention)
-  <span class="comment">│  │  ├─</span> RMSNorm
-  <span class="comment">│  │  └─</span> FFN / MoE
-  <span class="comment">│  └─</span> Final RMSNorm → Linear → logits
-  <span class="comment">└─</span> 存储 hidden_states / logits</div>
-    </div>
+  <span class="comment">│  └─</span> 更新 block table, 采样元数据, LoRA 状态
+  <span class="comment">│</span>
+  <span class="comment">├─</span> <span class="fn-worker">_prepare_inputs()</span> <span class="comment">(行 1776)</span>
+  <span class="comment">│  ├─</span> 排序 (decode 在前, prefill 在后)
+  <span class="comment">│  ├─</span> 构建 idx_mapping, query_start_loc
+  <span class="comment">│  ├─</span> [Prefill] Triton kernel 填 input_ids
+  <span class="comment">│  └─</span> [Decode] 合并上次 token + drafts
+  <span class="comment">│</span>
+  <span class="comment">├─</span> [CUDA Graph] → graph.replay()
+  <span class="comment">├─</span> [Eager] → <span class="fn-worker">model(**model_inputs)</span>
+  <span class="comment">│  ├─</span> Embedding → N × TransformerLayer → logits
+  <span class="comment">│  └─</span> [多模态] 注入 vision/audio embeddings
+  <span class="comment">│</span>
+  <span class="comment">└─</span> 暂存 logits → execute_model_state, 返回 <span class="comment">None</span></div>
   </div>
-
-  <div class="diagram-title" style="margin-top:24px">Stage 8: 采样</div>
-  <div class="diagram-box">
-    <div class="callstack"><span class="fn-worker">EngineCore.step() 中:</span>
-  <span class="fn-engine">execute_model()</span> → 暂存 logits（不采样）
-  <span class="fn-engine">get_grammar_bitmask()</span> → 结构化输出 mask
-  <span class="fn-sampler">sample_tokens(grammar_output)</span>
-  <span class="comment">  ├─</span> 从 state 取出 logits
-  <span class="comment">  ├─</span> <span class="fn-sampler">apply_grammar_bitmask()</span> → 不允许 token → -inf
-  <span class="comment">  ├─</span> <span class="fn-sampler">_sample(logits)</span>
-  <span class="comment">  │  └─</span> <span class="fn-sampler">Sampler.forward()</span>
-  <span class="comment">  │     ├─</span> logit_bias / allowed_token_ids
-  <span class="comment">  │     ├─</span> frequency / presence / repetition penalty
-  <span class="comment">  │     ├─</span> temperature 缩放
-  <span class="comment">  │     ├─</span> min-p / top-k / top-p 过滤
-  <span class="comment">  │     └─</span> top-k/top-p sampler / greedy
-  <span class="comment">  ├─</span> _update_states_after_model_execute()
-  <span class="comment">  └─</span> [Spec Decoding] propose_draft_token_ids()</div>
-  </div>
-
   <div class="file-ref">
     <span class="path">v1/worker/gpu_model_runner.py</span>:3787 execute &nbsp;|&nbsp;
-    <span class="path">v1/worker/gpu_model_runner.py</span>:1776 prepare &nbsp;|&nbsp;
-    <span class="path">v1/worker/gpu_model_runner.py</span>:4140 sample
+    <span class="path">v1/worker/gpu_model_runner.py</span>:1776 prepare
   </div>
-</section>
 
-<!-- ═══════ STAGE 9 ═══════ -->
-<section class="section" id="stage9">
-  <div class="section-label" style="color:var(--accent-engine)">Stage 9</div>
-  <div class="section-title">调度器更新状态</div>
-
+  <!-- Phase 3: Sample -->
+  <div style="height:1px;background:var(--border);margin:40px 0"></div>
+  <div class="diagram-title" style="color:var(--accent-cyan)">Phase 3: Sample — Stage 8</div>
   <div class="diagram-box">
-    <div class="callstack"><span class="fn-engine">update_from_output(scheduler_output, model_output)</span>
+    <div class="callstack"><span class="fn-sampler">GPUModelRunner.sample_tokens(grammar_output)</span> <span class="comment">(行 4140)</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> 从 execute_model_state 取出 logits <span class="comment">(GPU tensor)</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> <span class="fn-sampler">apply_grammar_bitmask()</span> → 不允许 token → -inf <span class="comment">[GPU]</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> <span class="fn-sampler">_sample(logits)</span> → <span class="fn-sampler">Sampler.forward()</span>
+  <span class="comment">│  ├─</span> apply_logits_processors():
+  <span class="comment">│  │  ├─</span> logit_bias / allowed_token_ids
+  <span class="comment">│  │  ├─</span> frequency / presence / repetition penalty
+  <span class="comment">│  │  ├─</span> temperature 缩放
+  <span class="comment">│  │  └─</span> min-p / top-k / top-p 过滤
+  <span class="comment">│  └─</span> top-k/top-p sampler <span class="comment">(FlashInfer CUDA kernel)</span> / greedy (argmax)
+  <span class="comment">│       全程 GPU, 避免 torch.multinomial 的同步
+  <span class="comment">│</span>
+  <span class="comment">├─</span> _update_states_after_model_execute()
+  <span class="comment">├─</span> _bookkeeping_sync() <span class="comment">→ GPU tensor → Python list[int]</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> [Spec Decoding] propose_draft_token_ids()
+  <span class="comment">│</span>
+  <span class="comment">└─</span> 返回 ModelRunnerOutput <span class="comment">(CPU, 含 sampled ids, logprobs)</span></div>
+  </div>
+  <div class="file-ref">
+    <span class="path">v1/worker/gpu_model_runner.py</span>:4140 sample &nbsp;|&nbsp;
+    <span class="path">v1/sample/sampler.py</span>:68 Sampler.forward
+  </div>
+
+  <!-- Phase 4: State Update -->
+  <div style="height:1px;background:var(--border);margin:40px 0"></div>
+  <div class="diagram-title" style="color:var(--accent-engine)">Phase 4: State Update — Stage 9</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-engine">Scheduler.update_from_output(scheduler_output, model_output)</span> <span class="comment">(行 1303)</span>
+  <span class="comment">│</span>
   <span class="comment">├─</span> 遍历所有被调度的请求：
   <span class="comment">│  ├─</span> [Spec Decoding] 计算被拒绝的 draft tokens
   <span class="comment">│  ├─</span> <span class="fn-engine">_update_request_with_output()</span>
   <span class="comment">│  │  ├─</span> request.append_output_token_ids(token)
-  <span class="comment">│  │  └─</span> check_stop()
-  <span class="comment">│  │     ├─</span> EOS / max_tokens
-  <span class="comment">│  │     └─</span> stop tokens
+  <span class="comment">│  │  └─</span> check_stop() → EOS / max_tokens / stop tokens
   <span class="comment">│  ├─</span> [结构化输出] grammar.accept_tokens()
   <span class="comment">│  └─</span> 如果 stopped:
-  <span class="comment">│     ├─</span> <span class="fn-engine">_handle_stopped_request()</span>
-  <span class="comment">│     │  └─</span> 释放 KV cache、移出 running
+  <span class="comment">│     ├─</span> _handle_stopped_request() → 释放 KV cache
   <span class="comment">│     └─</span> 创建 EngineCoreOutput
-  <span class="comment">│        ├─</span> new_token_ids: [int]
-  <span class="comment">│        ├─</span> finish_reason
-  <span class="comment">│        └─</span> logprobs
+  <span class="comment">│</span>
   <span class="comment">└─</span> 返回 EngineCoreOutputs → output_queue → ZMQ → API</div>
   </div>
-
-  <div style="display:flex;justify-content:center;margin:20px 0">
-    <div class="loop-badge">&#8635; 如果请求未完成，下一轮 schedule() Phase 1 会继续处理 (decode 每轮 1 token)</div>
-  </div>
-
   <div class="file-ref">
     <span class="path">v1/core/sched/scheduler.py</span>:1303 update_from_output &nbsp;|&nbsp;
     <span class="path">v1/core/sched/utils.py</span>:94 check_stop
   </div>
 </section>
-
 <!-- ═══════ STAGE 10-11 ═══════ -->
 <section class="section" id="stage10-11">
   <div class="section-label" style="color:var(--accent-purple)">Stage 10-11</div>
@@ -1192,7 +1206,7 @@ sequenceDiagram
     participant API as API Server
     participant C as Client
 
-    Note over W,C: ─── Stage 9: 状态更新 ───
+    Note over W,C: ─── Phase 4: State Update ───
     W->>S: sampled token ids
     Note right of S: append tokens<br/>check EOS / max_tokens<br/>build EngineCoreOutput
     S-->>E: EngineCoreOutput
@@ -1276,26 +1290,30 @@ sequenceDiagram
     participant W as GPUWorker
 
     C->>API: POST /v1/chat/completions
-    Note right of API: Stage 1: API 接收与解析<br/>Stage 2: 渲染与分词<br/>Stage 3: 多模态处理
+    Note right of API: Stage 1: API 接收与解析<br/>Stage 2-3: 渲染分词 / 多模态
     API->>A: generate()
-    Note right of A: Stage 4: 提交到引擎<br/>├ InputProcessor<br/>├ OutputProcessor.add<br/>└ ZMQ send
+    Note right of A: Stage 4: InputProcessor<br/>+ OutputProcessor.add + ZMQ send
 
     A->>E: ZMQ: ADD
     E->>S: add_request() → waiting
 
     rect rgba(63, 185, 80, 0.05)
-    Note over S,W: ── iteration loop (Stage 5-9) ──
+    Note over S,W: ── EngineCore.step() 循环 ──
+    Note over E: Phase 1: Schedule
     E->>S: schedule()
-    Note right of S: Phase 1: RUNNING<br/>Phase 2: WAITING → RUNNING
+    Note right of S: RUNNING decode<br/>WAITING → RUNNING<br/>allocate KV blocks
     S-->>E: SchedulerOutput
+    Note over E: Phase 2: Model Execution
     E->>W: execute_model()
-    Note right of W: Stage 6: prepare inputs<br/>Stage 7: model forward
-    W-->>E: hidden_states
+    Note right of W: _update_states<br/>_prepare_inputs<br/>model forward → logits
+    W-->>E: None (logits 暂存)
+    Note over E: Phase 3: Sample
     E->>W: sample_tokens()
-    Note right of W: Stage 8: grammar + sample
-    W-->>E: sampled ids
+    Note right of W: grammar mask [GPU]<br/>Sampler [GPU]<br/>bookkeeping sync
+    W-->>E: ModelRunnerOutput
+    Note over E: Phase 4: State Update
     E->>S: update_from_output()
-    Note right of S: Stage 9: append + stop
+    Note right of S: append tokens<br/>check stop<br/>free KV if done
     end
 
     E->>A: ZMQ PUSH EngineCoreOutputs
@@ -1304,7 +1322,7 @@ sequenceDiagram
     Note right of API: Stage 11: SSE
     API-->>C: data: {...}
 
-    Note over S,W: 重复 iteration 直到 finished
+    Note over S,W: 重复 step() 直到 finished
     API-->>C: data: [DONE]
     </pre>
   </div>
@@ -1437,6 +1455,27 @@ flowchart TD
         S5: Scheduler 跟踪 active LoRAs (max_loras)<br>
         S6: Worker 加载 LoRA weights → GPU<br>
         S8: CUDA Graph 按 num_active_loras 特化
+      </div>
+    </div>
+  </div>
+
+  <div class="diagram-box" style="margin-top:16px">
+    <div class="diagram-title" style="color:var(--accent-ipc)">DP / TP / PP 下的 Request 路由</div>
+    <div class="two-col" style="margin:0">
+      <div style="font-size:12px;color:var(--text-secondary);line-height:1.8">
+        <b style="color:var(--accent-engine)">TP/PP</b>：一个 EngineCore 调度一组 worker；<br>
+        这些 worker 共同完成同一个模型 forward。<br><br>
+        <b style="color:var(--accent-api)">DP</b>：多个 EngineCore，每个 DP rank<br>
+        管一组 worker；前端 <code>EngineCoreClient</code><br>
+        或外部负载均衡选择发到哪个 rank。
+      </div>
+      <div style="font-size:12px;color:var(--text-secondary);line-height:1.8">
+        <b>进程数量公式</b>：<br>
+        <code style="color:var(--accent-api)">API Server</code>: A (常随 DP 扩展)<br>
+        <code style="color:var(--accent-engine)">EngineCore</code>: DP<br>
+        <code style="color:var(--accent-worker)">GPU Worker</code>: N = DP × PP × TP<br>
+        <code style="color:var(--accent-ipc)">DP Coordinator</code>: DP &gt; 1 时为 1<br><br>
+        <span style="color:var(--text-muted)">client_index + request_id→engine 路由表<br>确保输出回到发起该 request 的 frontend</span>
       </div>
     </div>
   </div>
