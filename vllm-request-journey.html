@@ -623,6 +623,25 @@ body {
     <div class="legend-item"><div class="legend-dot" style="background:#79c0ff"></div> Renderer</div>
   </div>
 
+  <div class="two-col">
+    <div>
+      <div class="diagram-title">ChatCompletion请求对象</div>
+      <div class="callstack"><span class="fn-api">ChatCompletionRequest</span> &nbsp;(Pydantic model)
+  model, messages, temperature, max_tokens
+  stop, stop_token_ids, logprobs
+  response_format (结构化输出)
+  <span class="comment">image_url, audio_url, video_url (多模态)</span></div>
+    </div>
+    <div>
+      <div class="diagram-title">API服务启动调用栈</div>
+      <div class="callstack"><span class="fn-api">run_server()</span>
+  <span class="comment">└──</span> <span class="fn-api">run_server_worker()</span>
+        <span class="comment">├──</span> <span class="fn-api">build_async_engine_client()</span> → AsyncLLM
+        <span class="comment">├──</span> <span class="fn-api">build_app()</span> → FastAPI routes
+        <span class="comment">└──</span> uvicorn.run()</div>
+    </div>
+  </div>
+
   <div class="diagram-box mermaid-container">
     <pre class="mermaid">
 sequenceDiagram
@@ -648,25 +667,6 @@ sequenceDiagram
     </pre>
   </div>
 
-  <div class="two-col">
-    <div>
-      <div class="diagram-title">请求对象</div>
-      <div class="callstack"><span class="fn-api">ChatCompletionRequest</span> &nbsp;(Pydantic model)
-  model, messages, temperature, max_tokens
-  stop, stop_token_ids, logprobs
-  response_format (结构化输出)
-  <span class="comment">image_url, audio_url, video_url (多模态)</span></div>
-    </div>
-    <div>
-      <div class="diagram-title">调用栈</div>
-      <div class="callstack"><span class="fn-api">run_server()</span>
-  <span class="comment">└──</span> <span class="fn-api">run_server_worker()</span>
-        <span class="comment">├──</span> <span class="fn-api">build_async_engine_client()</span> → AsyncLLM
-        <span class="comment">├──</span> <span class="fn-api">build_app()</span> → FastAPI routes
-        <span class="comment">└──</span> uvicorn.run()</div>
-    </div>
-  </div>
-
   <div class="file-ref">
     <span class="path">entrypoints/openai/api_server.py</span> &rarr;
     <span class="path">chat_completion/api_router.py</span> &rarr;
@@ -685,7 +685,41 @@ sequenceDiagram
     <div class="legend-item"><div class="legend-dot" style="background:var(--accent-purple)"></div> MultiModal</div>
   </div>
 
-  <div class="diagram-title">Chat Request 渲染调用栈</div>
+  <!-- 四步主流程，放在最前面统领全局 -->
+  <div class="diagram-title">Renderer 四步主流程 &nbsp;&mdash;&nbsp; <span style="font-weight:400;color:var(--text-secondary)">render_chat() 的骨架</span></div>
+  <div class="flow-steps" style="max-width:600px;margin-bottom:32px">
+    <div class="flow-step">
+      <div class="step-num" style="background:rgba(88,166,255,0.15);color:var(--accent-api)">1</div>
+      <div class="step-content">
+        <div class="step-title">render_messages()</div>
+        <div class="step-desc">解析 chat messages + Jinja template → 文本 + mm_data</div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="step-num" style="background:rgba(88,166,255,0.15);color:var(--accent-api)">2</div>
+      <div class="step-content">
+        <div class="step-title">tokenize_prompts()</div>
+        <div class="step-desc">文本 → token IDs (HF tokenizer.encode)</div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="step-num" style="background:rgba(88,166,255,0.15);color:var(--accent-api)">3</div>
+      <div class="step-content">
+        <div class="step-title">_apply_prompt_extras()</div>
+        <div class="step-desc">cache_salt 等附加字段</div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="step-num" style="background:rgba(88,166,255,0.15);color:var(--accent-api)">4</div>
+      <div class="step-content">
+        <div class="step-title">process_for_engine()</div>
+        <div class="step-desc">多模态处理 → EngineInput (纯文本直接返回 tokens_input)</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Block 1: Serving 层 -->
+  <div class="diagram-title" style="color:var(--accent-api)">Serving 层调用</div>
   <div class="diagram-box">
     <div class="callstack"><span class="fn-api">OpenAIServingChat.create_chat_completion()</span>
   <span class="comment">├─</span> tokenizer / reasoning_parser 初始化
@@ -694,89 +728,82 @@ sequenceDiagram
   <span class="comment">│  └─</span> <span class="fn-render">openai_serving_render.render_chat(request)</span>
   <span class="comment">│     ├─</span> validate_chat_template(...)
   <span class="comment">│     └─</span> <span class="fn-render">preprocess_chat(...)</span>
-  <span class="comment">│        ├─</span> 构造 ChatParams
-  <span class="comment">│        └─</span> <span class="fn-render">renderer.render_chat_async(...)</span>
-  <span class="comment">│           ├─</span> <span style="color:#79c0ff;font-weight:600">HfRenderer.render_messages_async()</span>
-  <span class="comment">│           │  ├─</span> parse_chat_messages_async()
-  <span class="comment">│           │  │  <span class="comment">├─ 规范化 OpenAI message content</span>
-  <span class="comment">│           │  │  <span class="comment">├─ 下载/读取 image/audio/video parts</span>
-  <span class="comment">│           │  │  <span class="comment">├─ 输出 conversation</span>
-  <span class="comment">│           │  │  <span class="comment">├─ 输出 mm_data: MultiModalDataDict</span>
-  <span class="comment">│           │  │  <span class="comment">└─ 输出 mm_uuids</span>
-  <span class="comment">│           │  ├─</span> <span class="fn-render">safe_apply_chat_template()</span>
-  <span class="comment">│           │  └─</span> prompt dict (prompt + mm_data)
-  <span class="comment">│           ├─</span> <span style="color:#7ee787;font-weight:600">BaseRenderer.tokenize_prompts()</span>
-  <span class="comment">│           │  └─</span> tokenizer.encode()
-  <span class="comment">│           └─</span> <span style="color:#7ee787;font-weight:600">BaseRenderer.process_for_engine_async()</span>
-  <span class="comment">│              ├─</span> 无 MM: <span class="fn-render">tokens_input(prompt_token_ids)</span>
-  <span class="comment">│              └─</span> 有 MM: <span class="fn-mm">_process_multimodal_async()</span>
-  <span class="comment">│                 ├─</span> <span class="fn-mm">mm_processor.info.parse_mm_data()</span>
-  <span class="comment">│                 ├─</span> <span class="fn-mm">BaseMultiModalProcessor.apply()</span>
-  <span class="comment">│                 │  ├─</span> _cached_apply_hf_processor()
-  <span class="comment">│                 │  │  └─</span> <span class="fn-mm">_call_hf_processor()</span>
-  <span class="comment">│                 │  │     └─ HF ProcessorMixin (text+media → tensors)
-  <span class="comment">│                 │  ├─</span> _maybe_apply_prompt_updates()
-  <span class="comment">│                 │  └─</span> mm_input(...)
-  <span class="comment">│                 └─</span> MultiModalInput
+  <span class="comment">│        ├─</span> 构造 ChatParams (template, tools, mm_processor_kwargs, ...)
+  <span class="comment">│        └─</span> <span class="fn-render">renderer.render_chat_async(...)</span>  <span class="comment">← 进入四步主流程</span>
   <span class="comment">├─</span> 得到 conversation, engine_inputs
   <span class="comment">├─</span> request.to_sampling_params()
   <span class="comment">└─</span> <span class="fn-api">engine_client.generate(...)</span></div>
   </div>
 
-  <div class="two-col">
-    <div>
-      <div class="diagram-title">Renderer 四步主流程</div>
-      <div class="flow-steps">
-        <div class="flow-step">
-          <div class="step-num" style="background:rgba(88,166,255,0.15);color:var(--accent-api)">1</div>
-          <div class="step-content">
-            <div class="step-title">render_messages()</div>
-            <div class="step-desc">Jinja chat template → 文本</div>
-          </div>
-        </div>
-        <div class="flow-step">
-          <div class="step-num" style="background:rgba(88,166,255,0.15);color:var(--accent-api)">2</div>
-          <div class="step-content">
-            <div class="step-title">tokenize_prompts()</div>
-            <div class="step-desc">文本 → token IDs</div>
-          </div>
-        </div>
-        <div class="flow-step">
-          <div class="step-num" style="background:rgba(88,166,255,0.15);color:var(--accent-api)">3</div>
-          <div class="step-content">
-            <div class="step-title">_apply_prompt_extras()</div>
-            <div class="step-desc">cache_salt 等附加字段</div>
-          </div>
-        </div>
-        <div class="flow-step">
-          <div class="step-num" style="background:rgba(88,166,255,0.15);color:var(--accent-api)">4</div>
-          <div class="step-content">
-            <div class="step-title">process_for_engine()</div>
-            <div class="step-desc">多模态处理 → EngineInput</div>
-          </div>
-        </div>
+  <!-- Block 2: Renderer.render_chat_async -->
+  <div class="diagram-title" style="color:#79c0ff">Renderer.render_chat_async()</div>
+  <div class="diagram-box">
+  <!-- Step 1: render_messages -->
+    <div class="callstack"><span style="color:#79c0ff;font-weight:600">Step 1: HfRenderer.render_messages_async()</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> parse_chat_messages_async()
+  <span class="comment">│  ├─</span> 规范化 OpenAI message content
+  <span class="comment">│  ├─</span> 下载/读取 image/audio/video parts
+  <span class="comment">│  ├─</span> 输出 conversation
+  <span class="comment">│  ├─</span> 输出 mm_data: MultiModalDataDict
+  <span class="comment">│  └─</span> 输出 mm_uuids
+  <span class="comment">│</span>
+  <span class="comment">├─</span> <span class="fn-render">safe_apply_chat_template()</span>
+  <span class="comment">│  └─</span> HF tokenizer.apply_chat_template / Jinja
+  <span class="comment">│</span>
+  <span class="comment">├─</span> prompt dict:
+  <span class="comment">│  ├─</span> prompt / prompt_token_ids
+  <span class="comment">│  ├─</span> multi_modal_data = mm_data
+  <span class="comment">│  └─</span> multi_modal_uuids = mm_uuids</div>
+    <div style="height:1px;background:var(--border);margin:12px 0"></div>
+  <!-- Step 2: tokenize -->
+    <div class="callstack"><span style="color:#7ee787;font-weight:600">Step 2: BaseRenderer.tokenize_prompts()</span>
+  <span class="comment">└─</span> _tokenize_singleton_prompt()
+     <span class="comment">└─</span> tokenizer.encode() <span class="comment">（除非已有 prompt_token_ids）</span></div>
+    <div style="height:1px;background:var(--border);margin:12px 0"></div>
+  <!-- Step 3: apply_prompt_extras -->
+    <div class="callstack"><span style="color:#7ee787;font-weight:600">Step 3: BaseRenderer._apply_prompt_extras()</span>
+  <span class="comment">└─</span> 写入 cache_salt 等附加字段</div>
+    <div style="height:1px;background:var(--border);margin:12px 0"></div>
+  <!-- Step 4: process_for_engine -->
+    <div class="callstack"><span style="color:#7ee787;font-weight:600">Step 4: BaseRenderer.process_for_engine_async()</span>
+  <span class="comment">├─</span> 无 MM: <span class="fn-render">tokens_input(prompt_token_ids)</span> <span class="comment">→ 直接返回</span>
+  <span class="comment">└─</span> 有 MM: <span class="fn-mm">_process_multimodal_async()</span>
+     <span class="comment">├─</span> <span class="fn-mm">mm_processor.info.parse_mm_data()</span>
+     <span class="comment">│  └─</span> 原始 image/audio/video → MultiModalDataItems
+     <span class="comment">├─</span> parse_mm_uuids() + _process_mm_uuids()
+     <span class="comment">├─</span> 构造 ProcessorInputs
+     <span class="comment">└─</span> <span class="fn-mm">BaseMultiModalProcessor.apply()</span>
+        <span class="comment">├─</span> _cached_apply_hf_processor()
+        <span class="comment">│  └─</span> <span class="fn-mm">_call_hf_processor()</span>
+        <span class="comment">│     └─</span> HF ProcessorMixin (text+media → tensors)
+        <span class="comment">├─</span> _maybe_apply_prompt_updates()
+        <span class="comment">│  ├─</span> HF 已更新 prompt: _find_mm_placeholders()
+        <span class="comment">│  └─</span> HF 未更新: _apply_prompt_updates()
+        <span class="comment">└─</span> mm_input(prompt_token_ids, mm_kwargs, mm_hashes, mm_placeholders)</div>
+  </div>
+
+  <!-- vLLM vs HF Processor 分工 — 横向排列 -->
+  <div class="diagram-title">vLLM vs HF Processor 分工</div>
+  <div class="two-col" style="margin:0">
+    <div class="diagram-box" style="margin:0;padding:16px">
+      <div style="font-size:13px;margin-bottom:8px;color:var(--accent-purple);font-weight:600">vLLM BaseMultiModalProcessor</div>
+      <div style="font-size:12px;color:var(--text-secondary);line-height:1.8;padding-left:12px">
+        解析 MultiModalDataItems<br>
+        处理 processor cache<br>
+        计算 mm_hashes<br>
+        定义 prompt updates / placeholder 规则<br>
+        HF BatchFeature → MultiModalKwargsItems
       </div>
     </div>
-    <div>
-      <div class="diagram-title">vLLM vs HF Processor 分工</div>
-      <div class="diagram-box" style="padding:16px">
-        <div style="font-size:13px;margin-bottom:8px;color:var(--accent-purple);font-weight:600">vLLM BaseMultiModalProcessor</div>
-        <div style="font-size:12px;color:var(--text-secondary);line-height:1.8;padding-left:12px">
-          解析 MultiModalDataItems<br>
-          处理 processor cache<br>
-          计算 mm_hashes<br>
-          定义 prompt updates / placeholder 规则<br>
-          HF BatchFeature → MultiModalKwargsItems
-        </div>
-        <div style="height:1px;background:var(--border);margin:12px 0"></div>
-        <div style="font-size:13px;margin-bottom:8px;color:var(--accent-worker);font-weight:600">HF ProcessorMixin</div>
-        <div style="font-size:12px;color:var(--text-secondary);line-height:1.8;padding-left:12px">
-          图像 resize / normalize / patch<br>
-          音频 feature extraction<br>
-          视频 frame / vision 前处理<br>
-          text + media 联合 tokenization<br>
-          → BatchFeature (pixel_values, ...)
-        </div>
+    <div class="diagram-box" style="margin:0;padding:16px">
+      <div style="font-size:13px;margin-bottom:8px;color:var(--accent-worker);font-weight:600">HF ProcessorMixin</div>
+      <div style="font-size:12px;color:var(--text-secondary);line-height:1.8;padding-left:12px">
+        图像 resize / normalize / patch<br>
+        音频 feature extraction<br>
+        视频 frame / vision 前处理<br>
+        text + media 联合 tokenization<br>
+        → BatchFeature (pixel_values, ...)
       </div>
     </div>
   </div>
