@@ -1,0 +1,1722 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>vLLM CUDA Graph 全生命周期</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+:root {
+  --bg-primary: #0d1117;
+  --bg-secondary: #161b22;
+  --bg-tertiary: #21262d;
+  --border: #30363d;
+  --text-primary: #e6edf3;
+  --text-secondary: #8b949e;
+  --text-muted: #6e7681;
+  --accent-config: #58a6ff;
+  --accent-compile: #3fb950;
+  --accent-attn: #f0883e;
+  --accent-capture: #bc8cff;
+  --accent-dispatch: #39d2c0;
+  --accent-runtime: #d29922;
+  --accent-red: #f85149;
+  --accent-mm: #f778ba;
+  --font-sans: 'Inter', -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+
+body {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  line-height: 1.6;
+  overflow-x: hidden;
+}
+
+/* ─── Navigation ─── */
+.nav {
+  position: fixed;
+  top: 0; left: 0;
+  width: 270px;
+  height: 100vh;
+  background: var(--bg-secondary);
+  border-right: 1px solid var(--border);
+  padding: 24px 0;
+  overflow-y: auto;
+  z-index: 100;
+  transition: transform 0.3s ease;
+}
+.nav-logo {
+  padding: 0 20px 20px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 12px;
+}
+.nav-logo h2 {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: 0.5px;
+}
+.nav-logo span {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.nav a {
+  display: block;
+  padding: 7px 20px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  text-decoration: none;
+  transition: all 0.15s;
+  border-left: 2px solid transparent;
+}
+.nav a:hover {
+  color: var(--text-primary);
+  background: rgba(255,255,255,0.04);
+}
+.nav a.active {
+  color: var(--accent-config);
+  border-left-color: var(--accent-config);
+  background: rgba(88,166,255,0.06);
+}
+.nav .nav-group {
+  padding: 6px 20px 4px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--text-muted);
+  margin-top: 8px;
+}
+.nav .badge {
+  display: inline-block;
+  min-width: 18px; height: 18px;
+  border-radius: 4px;
+  text-align: center;
+  line-height: 18px;
+  font-size: 10px;
+  font-weight: 600;
+  margin-right: 6px;
+  vertical-align: middle;
+  padding: 0 3px;
+}
+.badge-config { background: rgba(88,166,255,0.15); color: var(--accent-config); }
+.badge-compile { background: rgba(63,185,80,0.15); color: var(--accent-compile); }
+.badge-attn { background: rgba(240,136,62,0.15); color: var(--accent-attn); }
+.badge-capture { background: rgba(188,140,255,0.15); color: var(--accent-capture); }
+.badge-dispatch { background: rgba(57,210,192,0.15); color: var(--accent-dispatch); }
+.badge-runtime { background: rgba(210,153,34,0.15); color: var(--accent-runtime); }
+.badge-mm { background: rgba(247,120,186,0.15); color: var(--accent-mm); }
+.badge-cross { background: rgba(210,153,34,0.15); color: var(--accent-runtime); }
+
+/* ─── Main Content ─── */
+.main {
+  margin-left: 270px;
+  min-height: 100vh;
+}
+
+.section {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 60px 40px 80px;
+  border-bottom: 1px solid var(--border);
+}
+.section:last-child { border-bottom: none; }
+
+.section-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 2px;
+  margin-bottom: 8px;
+}
+.section-title {
+  font-size: 32px;
+  font-weight: 700;
+  margin-bottom: 32px;
+  line-height: 1.2;
+}
+
+/* ─── Title Section ─── */
+.hero {
+  padding: 120px 40px 80px;
+  text-align: center;
+  border-bottom: 1px solid var(--border);
+}
+.hero-title {
+  font-size: 48px;
+  font-weight: 700;
+  line-height: 1.15;
+  margin-bottom: 16px;
+  background: linear-gradient(135deg, var(--accent-config), var(--accent-compile), var(--accent-capture));
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+.hero-sub {
+  font-size: 18px;
+  color: var(--text-secondary);
+  font-weight: 300;
+  max-width: 720px;
+  margin: 0 auto;
+}
+.hero-tags {
+  margin-top: 32px;
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+.hero-tag {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+/* ─── Diagram Containers ─── */
+.diagram-box {
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 32px;
+  margin: 24px 0;
+  overflow-x: auto;
+}
+.diagram-box.mermaid-container {
+  padding: 24px;
+}
+.diagram-caption {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-top: 16px;
+  font-style: italic;
+}
+.diagram-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-bottom: 16px;
+}
+
+/* ─── Call Stack Tree ─── */
+.callstack {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 2;
+  color: var(--text-secondary);
+  white-space: pre;
+  overflow-x: auto;
+  padding: 8px 0;
+}
+.callstack .fn-config { color: var(--accent-config); font-weight: 500; }
+.callstack .fn-compile { color: var(--accent-compile); font-weight: 500; }
+.callstack .fn-attn { color: var(--accent-attn); font-weight: 500; }
+.callstack .fn-capture { color: var(--accent-capture); font-weight: 500; }
+.callstack .fn-dispatch { color: var(--accent-dispatch); font-weight: 500; }
+.callstack .fn-runtime { color: var(--accent-runtime); font-weight: 500; }
+.callstack .fn-mm { color: var(--accent-mm); font-weight: 500; }
+.callstack .fn-red { color: var(--accent-red); font-weight: 500; }
+.callstack .comment { color: var(--text-muted); }
+.callstack .highlight { background: rgba(88,166,255,0.08); display: inline; }
+
+/* ─── Pipeline Diagram ─── */
+.pipeline {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  align-items: center;
+}
+.process-box {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 24px;
+  position: relative;
+}
+.process-box.config-process { border-color: rgba(88,166,255,0.3); }
+.process-box.compile-process { border-color: rgba(63,185,80,0.3); }
+.process-box.attn-process { border-color: rgba(240,136,62,0.3); }
+.process-box.capture-process { border-color: rgba(188,140,255,0.3); }
+.process-box.runtime-process { border-color: rgba(57,210,192,0.3); }
+.process-box.mm-process { border-color: rgba(247,120,186,0.3); }
+.process-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  margin-bottom: 16px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  display: inline-block;
+}
+.config-process .process-label { background: rgba(88,166,255,0.12); color: var(--accent-config); }
+.compile-process .process-label { background: rgba(63,185,80,0.12); color: var(--accent-compile); }
+.attn-process .process-label { background: rgba(240,136,62,0.12); color: var(--accent-attn); }
+.capture-process .process-label { background: rgba(188,140,255,0.12); color: var(--accent-capture); }
+.runtime-process .process-label { background: rgba(57,210,192,0.12); color: var(--accent-dispatch); }
+.mm-process .process-label { background: rgba(247,120,186,0.12); color: var(--accent-mm); }
+
+.stages-row {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+.stage-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.stage-chip .num {
+  width: 24px; height: 24px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+}
+.config-process .stage-chip { background: rgba(88,166,255,0.08); color: var(--accent-config); }
+.config-process .stage-chip .num { background: rgba(88,166,255,0.2); }
+.compile-process .stage-chip { background: rgba(63,185,80,0.08); color: var(--accent-compile); }
+.compile-process .stage-chip .num { background: rgba(63,185,80,0.2); }
+.attn-process .stage-chip { background: rgba(240,136,62,0.08); color: var(--accent-attn); }
+.attn-process .stage-chip .num { background: rgba(240,136,62,0.2); }
+.capture-process .stage-chip { background: rgba(188,140,255,0.08); color: var(--accent-capture); }
+.capture-process .stage-chip .num { background: rgba(188,140,255,0.2); }
+.runtime-process .stage-chip { background: rgba(57,210,192,0.08); color: var(--accent-dispatch); }
+.runtime-process .stage-chip .num { background: rgba(57,210,192,0.2); }
+.mm-process .stage-chip { background: rgba(247,120,186,0.08); color: var(--accent-mm); }
+.mm-process .stage-chip .num { background: rgba(247,120,186,0.2); }
+
+.arrow-down {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 8px 0;
+  color: var(--accent-runtime);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 1px;
+}
+.arrow-down .arrow { font-size: 20px; line-height: 1; }
+
+/* ─── File Reference ─── */
+.file-ref {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 12px 16px;
+  background: rgba(255,255,255,0.02);
+  border-radius: 6px;
+  margin-top: 16px;
+  border: 1px solid rgba(48,54,61,0.5);
+}
+.file-ref .path { color: var(--accent-config); }
+
+/* ─── Table ─── */
+.data-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  margin: 16px 0;
+}
+.data-table th {
+  text-align: left;
+  padding: 10px 12px;
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-muted);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-tertiary);
+}
+.data-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(48,54,61,0.5);
+  vertical-align: top;
+}
+.data-table tr:hover td {
+  background: rgba(255,255,255,0.02);
+}
+.data-table code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--accent-config);
+}
+
+/* ─── Flow Steps ─── */
+.flow-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.flow-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 10px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  background: rgba(255,255,255,0.02);
+}
+.flow-step .step-num {
+  min-width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.flow-step .step-content {
+  flex: 1;
+}
+.flow-step .step-title {
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+.flow-step .step-desc {
+  font-size: 12px;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+}
+
+/* ─── Mermaid Overrides ─── */
+.mermaid {
+  display: flex;
+  justify-content: center;
+}
+.mermaid svg {
+  max-width: 100%;
+}
+
+/* ─── Two Column Layout ─── */
+.two-col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
+  margin: 24px 0;
+}
+@media (max-width: 768px) {
+  .two-col { grid-template-columns: 1fr; }
+}
+
+/* ─── Color Legend ─── */
+.legend {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin: 16px 0;
+}
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.legend-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+}
+
+/* ─── Mode Badge ─── */
+.mode-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+  margin: 4px;
+}
+.mode-none { background: rgba(110,118,129,0.1); color: var(--text-muted); border: 1px solid rgba(110,118,129,0.2); }
+.mode-piecewise { background: rgba(188,140,255,0.1); color: var(--accent-capture); border: 1px solid rgba(188,140,255,0.2); }
+.mode-full { background: rgba(63,185,80,0.1); color: var(--accent-compile); border: 1px solid rgba(63,185,80,0.2); }
+
+/* ─── Concept Card ─── */
+.concept-card {
+  padding: 20px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-secondary);
+}
+.concept-card h4 {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+.concept-card p {
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+
+/* ─── Key Point Box ─── */
+.key-point {
+  padding: 16px 20px;
+  border-radius: 8px;
+  border-left: 3px solid var(--accent-dispatch);
+  background: rgba(57,210,192,0.04);
+  margin: 16px 0;
+  font-size: 13px;
+  color: var(--text-secondary);
+  line-height: 1.7;
+}
+
+/* ─── Responsive ─── */
+@media (max-width: 900px) {
+  .nav { transform: translateX(-100%); }
+  .nav.open { transform: translateX(0); }
+  .main { margin-left: 0; }
+  .hero-title { font-size: 32px; }
+  .section-title { font-size: 24px; }
+  .section { padding: 40px 20px 60px; }
+  .menu-toggle { display: flex !important; }
+}
+
+.menu-toggle {
+  display: none;
+  position: fixed;
+  top: 12px; left: 12px;
+  z-index: 200;
+  width: 40px; height: 40px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--text-primary);
+  font-size: 18px;
+}
+</style>
+</head>
+<body>
+
+<!-- Mobile Menu Toggle -->
+<div class="menu-toggle" onclick="document.querySelector('.nav').classList.toggle('open')">&#9776;</div>
+
+<!-- Navigation -->
+<nav class="nav">
+  <div class="nav-logo">
+    <h2>vLLM CUDA Graph</h2>
+    <span>Full Lifecycle Walkthrough</span>
+  </div>
+  <a href="#overview" class="active">全局概览</a>
+  <div class="nav-group">配置与编译</div>
+  <a href="#stage1"><span class="badge badge-config">1</span>配置解析与模式体系</a>
+  <a href="#stage2"><span class="badge badge-compile">2</span>编译切分与 Wrapper 注入</a>
+  <a href="#stage3"><span class="badge badge-attn">3</span>Attention 兼容性降级</a>
+  <div class="nav-group">初始化与 Capture</div>
+  <a href="#stage4"><span class="badge badge-capture">4</span>Graph Key 与 Bucketing</a>
+  <a href="#stage5"><span class="badge badge-capture">5</span>启动期 Capture</a>
+  <div class="nav-group">运行时执行</div>
+  <a href="#stage6"><span class="badge badge-dispatch">6</span>运行时 Dispatch 与 Padding</a>
+  <a href="#stage7"><span class="badge badge-dispatch">7</span>ForwardContext 驱动 Replay</a>
+  <div class="nav-group">扩展路径</div>
+  <a href="#stage8"><span class="badge badge-runtime">8</span>拆分 Runner 路径</a>
+  <a href="#stage9"><span class="badge badge-mm">9</span>多模态 Encoder CG</a>
+  <div class="nav-group">附录</div>
+  <a href="#crosscut">横切关注点</a>
+  <a href="#reading">代码阅读顺序</a>
+</nav>
+
+<!-- Main Content -->
+<div class="main">
+
+<!-- ═══════ HERO ═══════ -->
+<section class="hero" id="top">
+  <div class="hero-title">vLLM CUDA Graph 全生命周期</div>
+  <div class="hero-sub">从配置解析、Graph Capture 到运行时 Replay 的完整链路<br>聚焦 V1 架构下的模式体系、Padding、Attention 兼容性与多模态 Encoder</div>
+  <div class="hero-tags">
+    <span class="hero-tag" style="background:rgba(88,166,255,0.1);color:var(--accent-config)">
+      <i style="font-size:18px">&#9670;</i> 配置阶段
+    </span>
+    <span class="hero-tag" style="background:rgba(63,185,80,0.1);color:var(--accent-compile)">
+      <i style="font-size:18px">&#9670;</i> 编译装配
+    </span>
+    <span class="hero-tag" style="background:rgba(188,140,255,0.1);color:var(--accent-capture)">
+      <i style="font-size:18px">&#9670;</i> Capture
+    </span>
+    <span class="hero-tag" style="background:rgba(57,210,192,0.1);color:var(--accent-dispatch)">
+      <i style="font-size:18px">&#9670;</i> Runtime Dispatch
+    </span>
+    <span class="hero-tag" style="background:rgba(247,120,186,0.1);color:var(--accent-mm)">
+      <i style="font-size:18px">&#9670;</i> MM Encoder
+    </span>
+  </div>
+  <div style="margin-top:40px; font-size:13px; color:var(--text-muted)">
+    9 个阶段 &nbsp;|&nbsp; 3 种运行时模式 (NONE / PIECEWISE / FULL) &nbsp;|&nbsp; 2 套 Runner 路径
+  </div>
+</section>
+
+<!-- ═══════ OVERVIEW ═══════ -->
+<section class="section" id="overview">
+  <div class="section-label" style="color:var(--text-muted)">Architecture Overview</div>
+  <div class="section-title">全局概览</div>
+
+  <div class="key-point">
+    CUDA Graph 解决的是 <b>decode 阶段 CPU kernel launch overhead</b>：一轮 decode 的 GPU 计算由很多小 kernel 组成，逐个 launch 让 CPU 成为瓶颈。CUDA Graph 把一串 GPU 操作录制成图，之后 <code>graph.replay()</code> 一次提交整段计算。<br><br>
+    <b>两个硬约束：</b>① replay 时输入/输出/中间 buffer 的<b>地址</b>必须和 capture 时一致；② replay 时 shape、kernel grid、控制流必须和 capture 时一致。
+  </div>
+
+  <div class="pipeline" style="margin-top:32px">
+    <!-- 配置阶段 -->
+    <div class="process-box config-process">
+      <div class="process-label">配置阶段</div>
+      <div class="stages-row">
+        <div class="stage-chip"><span class="num">S1</span>VllmConfig 解析</div>
+        <div class="stage-chip"><span class="num">S1</span>CUDAGraphMode 定义</div>
+        <div class="stage-chip"><span class="num">S1</span>capture_sizes 生成</div>
+      </div>
+    </div>
+
+    <div class="arrow-down"><span class="arrow">&#8595;</span></div>
+
+    <!-- 编译装配 -->
+    <div class="process-box compile-process">
+      <div class="process-label">编译 / 装配阶段</div>
+      <div class="stages-row">
+        <div class="stage-chip"><span class="num">S2</span>set_splitting_ops_for_v1()</div>
+        <div class="stage-chip"><span class="num">S2</span>CUDAGraphWrapper 注入</div>
+        <div class="stage-chip"><span class="num">S3</span>Attention 兼容性检查</div>
+      </div>
+    </div>
+
+    <div class="arrow-down"><span class="arrow">&#8595;</span></div>
+
+    <!-- Worker 初始化 -->
+    <div class="process-box capture-process">
+      <div class="process-label">Worker 初始化 + Capture</div>
+      <div class="stages-row">
+        <div class="stage-chip"><span class="num">S4</span>Graph Key 初始化</div>
+        <div class="stage-chip"><span class="num">S5</span>warmup + capture</div>
+      </div>
+    </div>
+
+    <div class="arrow-down"><span class="arrow">&#8595;</span></div>
+
+    <!-- 运行时 -->
+    <div class="process-box runtime-process">
+      <div class="process-label">每个 EngineCore.step() 的模型执行阶段</div>
+      <div class="stages-row">
+        <div class="stage-chip"><span class="num">S6</span>Dispatch + Padding</div>
+        <div class="stage-chip"><span class="num">S7</span>ForwardContext → Replay</div>
+      </div>
+    </div>
+
+    <div class="arrow-down"><span class="arrow">&#8595;</span></div>
+
+    <!-- 扩展 -->
+    <div class="process-box mm-process">
+      <div class="process-label">扩展路径</div>
+      <div class="stages-row">
+        <div class="stage-chip"><span class="num">S8</span>拆分 Runner ModelCudaGraphManager</div>
+        <div class="stage-chip"><span class="num">S9</span>多模态 Encoder CUDA Graph</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 三个核心概念 -->
+  <div class="diagram-title" style="margin-top:40px">三个核心概念</div>
+  <div class="two-col" style="margin:0">
+    <div class="concept-card">
+      <h4 style="color:var(--accent-config)">CUDAGraphMode</h4>
+      <p>用户配置 + 运行时模式。配置态可以是组合模式 (FULL_DECODE_ONLY, FULL_AND_PIECEWISE)；运行时只会是 <span class="mode-badge mode-none">NONE</span> <span class="mode-badge mode-piecewise">PIECEWISE</span> <span class="mode-badge mode-full">FULL</span> 之一。</p>
+    </div>
+    <div class="concept-card">
+      <h4 style="color:var(--accent-dispatch)">BatchDescriptor</h4>
+      <p>运行时 CUDA Graph dispatch key。描述 padded 后的 <code>num_tokens</code>、<code>num_reqs</code>、<code>uniform</code> 和 LoRA 状态。</p>
+    </div>
+  </div>
+  <div class="concept-card" style="margin-top:16px">
+    <h4 style="color:var(--accent-capture)">ForwardContext</h4>
+    <p>把 dispatch 结果带进模型内部。CUDAGraphWrapper 只相信它，不重新做调度判断。包含 <code>cudagraph_runtime_mode</code>、<code>batch_descriptor</code>、<code>attn_metadata</code>、<code>slot_mapping</code> 等。</p>
+  </div>
+
+  <!-- FULL vs PIECEWISE -->
+  <div class="diagram-title" style="margin-top:40px">FULL vs PIECEWISE 一眼区分</div>
+  <div class="diagram-box" style="padding:0;overflow-x:auto">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>维度</th>
+          <th><span style="color:var(--accent-compile)">FULL</span></th>
+          <th><span style="color:var(--accent-capture)">PIECEWISE</span></th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>录制范围</td><td>整个模型 forward</td><td>编译切分后的若干子图</td></tr>
+        <tr><td>Attention</td><td>通常包含在 graph 内</td><td>通常作为 unsafe op 留在 graph 外</td></tr>
+        <tr><td>request padding</td><td>需要固定 <code>num_reqs</code></td><td><code>num_reqs=None</code>，只关心 <code>num_tokens</code></td></tr>
+        <tr><td>典型场景</td><td>uniform decode，尤其纯 decode</td><td>mixed prefill-decode / 后端不支持 full attention graph</td></tr>
+        <tr><td>调度优先级</td><td>优先尝试</td><td>FULL 不匹配时再尝试</td></tr>
+        <tr><td>源码主路径</td><td>外层 <code>CUDAGraphWrapper(runtime_mode=FULL)</code></td><td>子图 <code>CUDAGraphWrapper(runtime_mode=PIECEWISE)</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="file-ref">阅读路径：全局总图 → Stage 1-3 配置编译 → Stage 4-5 Capture → Stage 6-7 运行时 → Stage 8-9 扩展路径</div>
+</section>
+
+<!-- ═══════ STAGE 1 ═══════ -->
+<section class="section" id="stage1">
+  <div class="section-label" style="color:var(--accent-config)">Stage 1</div>
+  <div class="section-title">配置解析与模式体系</div>
+
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:var(--accent-config)"></div> Config / Mode</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--accent-compile)"></div> Capture Sizes</div>
+  </div>
+
+  <div class="diagram-title">CUDAGraphMode 定义</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-config">CUDAGraphMode</span> <span class="comment">(compilation.py)</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> <span class="fn-config">NONE = 0</span>              <span class="comment">→ 所有 batch → NONE</span>
+  <span class="comment">├─</span> <span class="fn-compile">PIECEWISE = 1</span>        <span class="comment">→ 所有可匹配 batch → PIECEWISE</span>
+  <span class="comment">├─</span> <span class="fn-compile">FULL = 2</span>              <span class="comment">→ 所有可匹配 batch → FULL</span>
+  <span class="comment">├─</span> <span class="fn-capture">FULL_DECODE_ONLY = (FULL, NONE)</span>
+  <span class="comment">│   ├─</span> uniform decode → FULL
+  <span class="comment">│   └─</span> mixed prefill-decode → NONE
+  <span class="comment">└─</span> <span class="fn-capture">FULL_AND_PIECEWISE = (FULL, PIECEWISE)</span>
+  <span class="comment">    ├─</span> uniform decode → FULL
+  <span class="comment">    └─</span> mixed prefill-decode → PIECEWISE</div>
+  </div>
+
+  <div class="diagram-title">配置态到运行态映射</div>
+  <div class="diagram-box mermaid-container">
+    <pre class="mermaid">
+flowchart TD
+    A["CUDAGraphMode 配置态"] --> B{NONE?}
+    B -->|Yes| C["所有 batch → NONE"]
+    B -->|No| D{PIECEWISE?}
+    D -->|Yes| E["可匹配 batch → PIECEWISE"]
+    D -->|No| F{FULL?}
+    F -->|Yes| G["可匹配 batch → FULL"]
+    F -->|No| H{FULL_DECODE_ONLY?}
+    H -->|Yes| I["decode → FULL<br/>mixed → NONE"]
+    H -->|No| J["decode → FULL<br/>mixed → PIECEWISE"]
+
+    style A fill:#1c2128,stroke:#58a6ff,color:#e6edf3
+    style C fill:#1c2128,stroke:#6e7681,color:#8b949e
+    style E fill:#1c2128,stroke:#bc8cff,color:#e6edf3
+    style G fill:#1c2128,stroke:#3fb950,color:#e6edf3
+    style I fill:#1c2128,stroke:#3fb950,color:#e6edf3
+    style J fill:#1c2128,stroke:#bc8cff,color:#e6edf3
+    </pre>
+  </div>
+
+  <div class="diagram-title">Capture Sizes 初始化</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-config">VllmConfig._set_cudagraph_sizes()</span> <span class="comment">(vllm.py)</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> enforce_eager 或 mode=NONE:
+  <span class="comment">│  └─</span> max_cudagraph_capture_size = 0, capture_sizes = []
+  <span class="comment">│</span>
+  <span class="comment">├─</span> 确定 max_cudagraph_capture_size
+  <span class="comment">│  ├─</span> 用户显式设置 → 使用用户值
+  <span class="comment">│  └─</span> 默认: min(max_num_seqs * decode_query_len * 2, 512)
+  <span class="comment">│</span>
+  <span class="comment">├─</span> 生成 capture sizes
+  <span class="comment">│  ├─</span> interactivity: 1..min(max_size, 32)
+  <span class="comment">│  └─</span> 默认: [1,2,4] + range(8,256,8) + range(256,max+1,16)
+  <span class="comment">│</span>
+  <span class="comment">├─</span> max_num_batched_tokens 在范围内 → 也加入
+  <span class="comment">├─</span> sequence parallelism → 调整到 TP 兼容大小
+  <span class="comment">└─</span> post_init_cudagraph_sizes()</div>
+  </div>
+
+  <div class="key-point">
+    <b>capture size 是 token 数</b>，不是 request 数。对纯 decode 而言 <code>num_tokens ≈ num_reqs * decode_query_len</code>。speculative decoding 下 <code>decode_query_len = 1 + num_speculative_tokens</code>，capture size 需要被调整为它的倍数。
+  </div>
+
+  <div class="file-ref">
+    <span class="path">vllm/config/compilation.py</span> CUDAGraphMode &nbsp;|&nbsp;
+    <span class="path">vllm/config/vllm.py</span> _set_cudagraph_sizes()
+  </div>
+</section>
+
+<!-- ═══════ STAGE 2 ═══════ -->
+<section class="section" id="stage2">
+  <div class="section-label" style="color:var(--accent-compile)">Stage 2</div>
+  <div class="section-title">编译切分与 CUDAGraphWrapper 注入</div>
+
+  <div class="diagram-title">切分规则</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-compile">CompilationConfig.set_splitting_ops_for_v1()</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> mode 不是 VLLM_COMPILE:
+  <span class="comment">│  └─</span> 只初始化 splitting_ops，不进入 piecewise compile 主路径
+  <span class="comment">│</span>
+  <span class="comment">├─</span> splitting_ops is None:
+  <span class="comment">│  ├─</span> 默认加入 attention ops
+  <span class="comment">│  ├─</span> 非 inductor partition: 追加 unified_kv_cache_update
+  <span class="comment">│  └─</span> 这些 op 会留在 piecewise CUDA Graph 外
+  <span class="comment">│</span>
+  <span class="comment">├─</span> splitting_ops == [] 且有 PIECEWISE:
+  <span class="comment">│  ├─</span> PIECEWISE → NONE
+  <span class="comment">│  └─</span> FULL_AND_PIECEWISE → FULL
+  <span class="comment">│</span>
+  <span class="comment">└─</span> 并行/通信特性可能进一步降级 PIECEWISE → FULL / NONE</div>
+  </div>
+
+  <div class="diagram-title">Wrapper 注入路径</div>
+  <div class="two-col" style="margin:0">
+    <div class="diagram-box" style="margin:0">
+      <div style="font-size:13px;font-weight:600;color:var(--accent-capture);margin-bottom:8px">PIECEWISE 注入</div>
+      <div class="callstack"><span class="fn-capture">Dynamo piecewise split 路径</span>
+  <span class="comment">└─</span> <span class="fn-compile">backends.py</span>
+     <span class="comment">└─</span> wrap_with_cudagraph_if_needed()
+        <span class="comment">└─</span> <span class="fn-capture">CUDAGraphWrapper(
+             runnable=piecewise_backend,
+             runtime_mode=PIECEWISE,
+           )</span>
+
+<span class="fn-capture">Inductor graph partition 路径</span>
+  <span class="comment">└─</span> <span class="fn-compile">decorators.py</span>
+     <span class="comment">└─</span> maybe_use_cudagraph_partition_wrapper()
+        <span class="comment">└─</span> 每个 partition 创建
+           <span class="fn-capture">CUDAGraphWrapper(
+             runtime_mode=PIECEWISE,
+           )</span></div>
+    </div>
+    <div class="diagram-box" style="margin:0">
+      <div style="font-size:13px;font-weight:600;color:var(--accent-compile);margin-bottom:8px">FULL 注入</div>
+      <div class="callstack"><span class="fn-compile">GPUModelRunner.load_model()</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> STOCK_TORCH_COMPILE:
+  <span class="comment">│  └─</span> model.compile(fullgraph=True, ...)
+  <span class="comment">│</span>
+  <span class="comment">└─</span> vLLM 控制 CUDA Graph:
+     <span class="comment">├─</span> has_full_cudagraphs 且未启用 ubatching:
+     <span class="comment">│  └─</span> self.model = <span class="fn-compile">CUDAGraphWrapper(
+     <span class="comment">       self.model,</span>
+     <span class="comment">       runtime_mode=FULL)</span>
+     <span class="comment">└─</span> 启用 ubatching:
+        <span class="comment">└─</span> self.model = UBatchWrapper(...)</div>
+    </div>
+  </div>
+
+  <div class="diagram-title" style="margin-top:24px">CUDAGraphWrapper 行为</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-capture">CUDAGraphWrapper.__call__(*args, **kwargs)</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> 没有 ForwardContext:
+  <span class="comment">│  └─</span> 直接 runnable(*args, **kwargs)
+  <span class="comment">│</span>
+  <span class="comment">├─</span> 读取 get_forward_context()
+  <span class="comment">│  ├─</span> cudagraph_runtime_mode
+  <span class="comment">│  └─</span> batch_descriptor
+  <span class="comment">│</span>
+  <span class="comment">├─</span> runtime_mode == NONE 或 != self.runtime_mode:
+  <span class="comment">│  └─</span> 直接 runnable(*args, **kwargs)
+  <span class="comment">│</span>
+  <span class="comment">├─</span> <span style="color:var(--accent-dispatch);font-weight:600">第一次见到 batch_descriptor:</span>
+  <span class="comment">│  ├─</span> validate_cudagraph_capturing_enabled()
+  <span class="comment">│  ├─</span> 记录输入 tensor 地址
+  <span class="comment">│  ├─</span> torch.cuda.CUDAGraph()
+  <span class="comment">│  ├─</span> get_offloader().sync_prev_onload()
+  <span class="comment">│  ├─</span> with torch.cuda.graph(...):
+  <span class="comment">│  │  ├─</span> output = runnable(*args, **kwargs)
+  <span class="comment">│  │  ├─</span> get_offloader().join_after_forward()
+  <span class="comment">│  │  └─</span> weak_ref_tensors(output)
+  <span class="comment">│  └─</span> 缓存 entry.cudagraph / entry.output
+  <span class="comment">│</span>
+  <span class="comment">└─</span> <span style="color:var(--accent-compile);font-weight:600">已 capture:</span>
+     <span class="comment">├─</span> DEBUG: 检查输入地址不变
+     <span class="comment">├─</span> get_offloader().sync_prev_onload()
+     <span class="comment">├─</span> <span style="color:var(--accent-compile);font-weight:600">entry.cudagraph.replay()</span>
+     <span class="comment">└─</span> return entry.output</div>
+  </div>
+
+  <div class="key-point">
+    <code>CUDAGraphWrapper</code> <b>不负责决定</b>应该用哪个 graph。它只读取 <code>ForwardContext</code> 里的 <code>cudagraph_runtime_mode</code> 和 <code>batch_descriptor</code>。真正的 dispatch 发生在 model runner。
+  </div>
+
+  <div class="file-ref">
+    <span class="path">vllm/config/compilation.py</span> set_splitting_ops_for_v1 &nbsp;|&nbsp;
+    <span class="path">vllm/compilation/backends.py</span> wrap_with_cudagraph_if_needed &nbsp;|&nbsp;
+    <span class="path">vllm/compilation/cuda_graph.py</span> CUDAGraphWrapper
+  </div>
+</section>
+
+<!-- ═══════ STAGE 3 ═══════ -->
+<section class="section" id="stage3">
+  <div class="section-label" style="color:var(--accent-attn)">Stage 3</div>
+  <div class="section-title">Attention 兼容性与模式降级</div>
+
+  <div class="diagram-title">AttentionCGSupport 支持等级</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-attn">AttentionCGSupport</span> <span class="comment">(attention/backend.py)</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> <span style="color:var(--accent-compile);font-weight:600">ALWAYS = 3</span>
+  <span class="comment">│  └─</span> 支持 mixed prefill-decode 的 full CUDA Graph
+  <span class="comment">│</span>
+  <span class="comment">├─</span> <span style="color:var(--accent-dispatch);font-weight:600">UNIFORM_BATCH = 2</span>
+  <span class="comment">│  └─</span> 只支持所有 request query_len 相同的 batch
+  <span class="comment">│</span>
+  <span class="comment">├─</span> <span style="color:var(--accent-attn);font-weight:600">UNIFORM_SINGLE_TOKEN_DECODE = 1</span>
+  <span class="comment">│  └─</span> 只支持 query_len == 1 的纯 decode
+  <span class="comment">│</span>
+  <span class="comment">└─</span> <span style="color:var(--accent-red);font-weight:600">NEVER = 0</span>
+     <span class="comment">└─</span> attention 不支持 full CUDA Graph</div>
+  </div>
+
+  <div class="diagram-title">兼容性检查调用栈</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-attn">GPUModelRunner.initialize_kv_cache(kv_cache_config)</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> <span class="fn-attn">_check_and_update_cudagraph_mode(...)</span>
+  <span class="comment">│  ├─</span> 遍历 kv_cache_groups
+  <span class="comment">│  ├─</span> 获取每个 layer 的 AttentionBackend
+  <span class="comment">│  ├─</span> builder_cls.get_cudagraph_support(vllm_config, kv_cache_spec)
+  <span class="comment">│  └─</span> 取最低支持等级 <span class="fn-attn">min_cg_support</span>
+  <span class="comment">│</span>
+  <span class="comment">└─</span> <span class="fn-config">resolve_cudagraph_mode_and_sizes(...)</span>
+     <span class="comment">├─</span> mixed_mode=FULL 但 min_cg_support != ALWAYS:
+     <span class="comment">│  ├─</span> NEVER → PIECEWISE 或抛错
+     <span class="comment">│  └─</span> 否则降级到 FULL_AND_PIECEWISE / FULL_DECODE_ONLY
+     <span class="comment">│</span>
+     <span class="comment">├─</span> decode_mode=FULL 但 min_cg_support=NEVER:
+     <span class="comment">│  ├─</span> attention 已 piecewise compile → PIECEWISE
+     <span class="comment">│  └─</span> 否则 → NONE
+     <span class="comment">│</span>
+     <span class="comment">├─</span> spec decode 且 decode_query_len > 1:
+     <span class="comment">│  └─</span> 要求至少 UNIFORM_BATCH，否则降级
+     <span class="comment">│</span>
+     <span class="comment">├─</span> Mamba + FULL:
+     <span class="comment">│  └─</span> 检查 max_num_reqs 是否超过可用 Mamba cache blocks
+     <span class="comment">│</span>
+     <span class="comment">└─</span> adjust_cudagraph_sizes_for_spec_decode(...)</div>
+  </div>
+
+  <div class="diagram-title">兼容性对模式的影响</div>
+  <div class="diagram-box mermaid-container">
+    <pre class="mermaid">
+flowchart TD
+    REQ["用户请求 FULL_AND_PIECEWISE"] --> CHECK{Attention 支持等级?}
+
+    CHECK -->|ALWAYS| A["decode: FULL<br/>mixed: PIECEWISE"]
+    CHECK -->|UNIFORM_SINGLE_TOKEN_DECODE| B["decode: FULL<br/>spec decode: 可能降级<br/>mixed: PIECEWISE"]
+    CHECK -->|NEVER| C{attention 已 piecewise 切出?}
+    C -->|Yes| D["→ PIECEWISE"]
+    C -->|No| E["→ NONE 或抛错"]
+
+    style REQ fill:#1c2128,stroke:#bc8cff,color:#e6edf3
+    style A fill:#1c2128,stroke:#3fb950,color:#e6edf3
+    style B fill:#1c2128,stroke:#f0883e,color:#e6edf3
+    style D fill:#1c2128,stroke:#bc8cff,color:#e6edf3
+    style E fill:#1c2128,stroke:#f85149,color:#e6edf3
+    </pre>
+  </div>
+
+  <div class="key-point">
+    PIECEWISE 很重要：即使 attention backend 不能进入 CUDA Graph，其他线性层、norm、激活、MoE 等子图仍然可以被 capture/replay。
+  </div>
+
+  <div class="file-ref">
+    <span class="path">vllm/v1/attention/backend.py</span> AttentionCGSupport &nbsp;|&nbsp;
+    <span class="path">vllm/config/compilation.py</span> resolve_cudagraph_mode_and_sizes
+  </div>
+</section>
+
+<!-- ═══════ STAGE 4 ═══════ -->
+<section class="section" id="stage4">
+  <div class="section-label" style="color:var(--accent-capture)">Stage 4</div>
+  <div class="section-title">Graph Key 初始化与 Bucketing</div>
+
+  <div class="diagram-title">BatchDescriptor 数据结构</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-capture">@dataclass(frozen=True)</span>
+<span class="fn-capture">BatchDescriptor</span> <span class="comment">(forward_context.py)</span>
+  <span class="comment">├─</span> num_tokens: int           <span class="comment">→ padding 后的 token 数 (capture size)</span>
+  <span class="comment">├─</span> num_reqs: int | None      <span class="comment">→ PIECEWISE 下可以是 None</span>
+  <span class="comment">├─</span> uniform: bool             <span class="comment">→ 所有 request 是否同样 query length</span>
+  <span class="comment">├─</span> has_lora: bool            <span class="comment">→ 是否有 LoRA</span>
+  <span class="comment">└─</span> num_active_loras: int     <span class="comment">→ LoRA 会改变 kernel 路径</span></div>
+  </div>
+
+  <div class="diagram-title">CudagraphDispatcher 初始化</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-capture">CudagraphDispatcher.initialize_cudagraph_keys(mode, uniform_decode_query_len)</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> mode == NONE → 直接返回
+  <span class="comment">│</span>
+  <span class="comment">├─</span> <span class="fn-capture">_compute_bs_to_padded_graph_size()</span>
+  <span class="comment">│  └─</span> 为每个 0..max_size 的 token 数预计算 pad 到哪个 capture size
+  <span class="comment">│</span>
+  <span class="comment">├─</span> <span class="fn-capture">_get_lora_cases()</span>
+  <span class="comment">│  ├─</span> 无 LoRA → [0]
+  <span class="comment">│  ├─</span> cudagraph_specialize_lora=True → [0] + captured_lora_counts
+  <span class="comment">│  └─</span> 否则 → [max_loras + 1]
+  <span class="comment">│</span>
+  <span class="comment">├─</span> mixed_mode != NONE:
+  <span class="comment">│  ├─</span> 遍历 cudagraph_capture_sizes × lora_cases
+  <span class="comment">│  ├─</span> _create_padded_batch_descriptor(bs, uniform_decode=False)
+  <span class="comment">│  │  └─</span> PIECEWISE: replace(num_reqs=None, uniform=False)
+  <span class="comment">│  └─</span> add_cudagraph_key(mixed_mode, batch_desc)
+  <span class="comment">│</span>
+  <span class="comment">└─</span> decode_mode == FULL 且 separate_routine:
+     <span class="comment">├─</span> 只保留 &lt;= max_num_seqs * uniform_decode_query_len 的 size
+     <span class="comment">├─</span> _create_padded_batch_descriptor(bs, uniform_decode=True)
+     <span class="comment">└─</span> add_cudagraph_key(FULL, batch_desc)</div>
+  </div>
+
+  <div class="diagram-title">Padding 映射示例</div>
+  <div class="diagram-box" style="padding:0;overflow-x:auto">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>真实 num_tokens</th>
+          <th>padded num_tokens</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td><code>1</code></td><td><code>1</code></td></tr>
+        <tr><td><code>2</code></td><td><code>2</code></td></tr>
+        <tr><td><code>3</code></td><td><code>4</code></td></tr>
+        <tr><td><code>4</code></td><td><code>4</code></td></tr>
+        <tr><td><code>5</code></td><td><code>8</code></td></tr>
+        <tr><td><code>7</code></td><td><code>8</code></td></tr>
+        <tr><td><code>9</code></td><td><code>16</code></td></tr>
+        <tr><td><code>17</code></td><td><code>24</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div style="font-size:12px;color:var(--text-muted);text-align:center;margin-top:8px">
+    真实 batch 不需要刚好等于 capture size，只要能 pad 到某个已录制 size
+  </div>
+
+  <div class="file-ref">
+    <span class="path">vllm/forward_context.py</span> BatchDescriptor &nbsp;|&nbsp;
+    <span class="path">vllm/v1/cudagraph_dispatcher.py</span> initialize_cudagraph_keys
+  </div>
+</section>
+
+<!-- ═══════ STAGE 5 ═══════ -->
+<section class="section" id="stage5">
+  <div class="section-label" style="color:var(--accent-capture)">Stage 5</div>
+  <div class="section-title">启动期 Capture</div>
+
+  <div class="diagram-title">Capture 入口</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-capture">GPUModelRunner.capture_model()</span> <span class="comment">(gpu_model_runner.py)</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> mode == NONE → 跳过
+  <span class="comment">│</span>
+  <span class="comment">├─</span> cudagraph_mm_encoder=True → 初始化 EncoderCudaGraphManager
+  <span class="comment">│</span>
+  <span class="comment">├─</span> init_routed_experts_capturer() <span class="comment">→ MoE buffer 地址固定</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> set_cudagraph_capturing_enabled(True)
+  <span class="comment">│</span>
+  <span class="comment">├─</span> with _freeze_gc(), graph_capture(device):
+  <span class="comment">│  ├─</span> synchronize() + empty_cache()
+  <span class="comment">│  ├─</span> for mode, batch_descs in <span class="fn-capture">dispatcher.get_capture_descs()</span>:
+  <span class="comment">│  │  └─</span> _capture_cudagraphs(batch_descs, mode)
+  <span class="comment">│  └─</span> encoder_cudagraph_manager.capture()
+  <span class="comment">│</span>
+  <span class="comment">├─</span> set_cudagraph_capturing_enabled(False)
+  <span class="comment">├─</span> empty_cache()
+  <span class="comment">└─</span> lock_workspace()</div>
+  </div>
+
+  <div class="key-point">
+    <code>get_capture_descs()</code> 返回顺序固定为 PIECEWISE → FULL，每组内部按 <code>num_tokens</code> 降序。先让大 graph 分配/占住较大的 graph pool，再让小 graph 复用。
+  </div>
+
+  <div class="diagram-title">单组 Capture 调用栈</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-capture">_capture_cudagraphs(batch_descriptors, runtime_mode)</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> 判断是否允许 ubatching capture
+  <span class="comment">│  └─</span> 目前只在 FULL + uniform decode + 达到阈值时
+  <span class="comment">│</span>
+  <span class="comment">└─</span> for batch_desc in batch_descriptors:
+     <span class="comment">└─</span> <span class="fn-capture">_warmup_and_capture(batch_desc, runtime_mode)</span>
+        <span class="comment">│</span>
+        <span class="comment">├─</span> warmup: _dummy_run(mode=<span class="fn-red">NONE</span>) <span class="comment">→ 触发编译、分配 workspace</span>
+        <span class="comment">│</span>
+        <span class="comment">└─</span> capture: _dummy_run(mode=<span style="color:var(--accent-capture);font-weight:600">runtime_mode</span>,
+        <span class="comment">                       is_graph_capturing=True)</span>
+           <span class="comment">└─</span> CUDAGraphWrapper 首次 capture</div>
+  </div>
+
+  <div class="diagram-title">Capture 时序图</div>
+  <div class="diagram-box mermaid-container">
+    <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant MR as GPUModelRunner
+    participant CD as CudagraphDispatcher
+    participant DR as _dummy_run
+    participant FC as ForwardContext
+    participant CW as CUDAGraphWrapper
+
+    MR->>CD: get_capture_descs()
+    CD-->>MR: PIECEWISE → FULL (降序)
+
+    loop For each (mode, batch_descs)
+        MR->>DR: warmup: mode=NONE
+        DR->>FC: cudagraph_runtime=NONE
+        FC->>CW: pass through (eager)
+        CW-->>FC: output
+        FC-->>DR: done
+
+        MR->>DR: capture: mode=PW/FULL
+        DR->>FC: batch_descriptor=desc
+        FC->>CW: torch.cuda.graph() + runnable forward
+        Note right of CW: 录制 GPU 操作到图
+        CW-->>FC: cache graph entry
+        FC-->>DR: done
+    end
+
+    MR->>MR: set_cudagraph_capturing_enabled(False)
+    MR->>MR: lock_workspace()
+    </pre>
+  </div>
+
+  <div class="file-ref">
+    <span class="path">vllm/v1/worker/gpu_model_runner.py</span> capture_model &nbsp;|&nbsp;
+    <span class="path">vllm/v1/cudagraph_dispatcher.py</span> get_capture_descs
+  </div>
+</section>
+
+<!-- ═══════ STAGE 6 ═══════ -->
+<section class="section" id="stage6">
+  <div class="section-label" style="color:var(--accent-dispatch)">Stage 6</div>
+  <div class="section-title">运行时 Dispatch 与 Padding</div>
+
+  <div class="diagram-title">execute_model() 中的 Dispatch 路径</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-dispatch">GPUModelRunner.execute_model(scheduler_output)</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> _update_states(scheduler_output)
+  <span class="comment">├─</span> _prepare_inputs(...)
+  <span class="comment">├─</span> 计算 num_reqs, num_tokens_unpadded, ...
+  <span class="comment">│</span>
+  <span class="comment">├─</span> <span class="fn-dispatch">_determine_batch_execution_and_padding(...)</span>
+  <span class="comment">│  ├─</span> _is_uniform_decode(...)
+  <span class="comment">│  ├─</span> has_lora / num_active_loras
+  <span class="comment">│  ├─</span> _pad_for_sequence_parallelism(num_tokens)
+  <span class="comment">│  ├─</span> <span style="color:var(--accent-dispatch);font-weight:600">cudagraph_dispatcher.dispatch(...)</span>
+  <span class="comment">│  ├─</span> DP: coordinate_batch_across_dp(...)
+  <span class="comment">│  └─</span> → mode, batch_desc, should_ubatch, num_tokens_across_dp
+  <span class="comment">│</span>
+  <span class="comment">├─</span> num_tokens_padded = batch_desc.num_tokens
+  <span class="comment">├─</span> num_reqs_padded = batch_desc.num_reqs or num_reqs
+  <span class="comment">├─</span> _get_slot_mappings(...)
+  <span class="comment">├─</span> _build_attention_metadata(...)
+  <span class="comment">├─</span> _preprocess(...)
+  <span class="comment">│</span>
+  <span class="comment">└─</span> with set_forward_context(...):
+     <span class="comment">└─</span> self._model_forward(...)</div>
+  </div>
+
+  <div class="diagram-title">Dispatch 决策调用栈</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-dispatch">CudagraphDispatcher.dispatch(num_tokens, uniform_decode, has_lora, ...)</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> allowed_modes = valid_modes - invalid_modes
+  <span class="comment">│</span>
+  <span class="comment">├─</span> 未初始化 / mode=NONE / num_tokens > max_size / 只允许 NONE:
+  <span class="comment">│  └─</span> return <span class="fn-red">NONE</span>, BatchDescriptor(num_tokens)
+  <span class="comment">│</span>
+  <span class="comment">├─</span> 归一化 LoRA count
+  <span class="comment">│</span>
+  <span class="comment">├─</span> batch_desc = _create_padded_batch_descriptor(...)
+  <span class="comment">│  ├─</span> num_tokens → _bs_to_padded_graph_size[num_tokens]
+  <span class="comment">│  ├─</span> FULL uniform decode: num_reqs = padded_tokens // decode_query_len
+  <span class="comment">│  └─</span> mixed / PIECEWISE: num_reqs = min(padded_tokens, max_num_seqs)
+  <span class="comment">│</span>
+  <span class="comment">├─</span> FULL 被允许且 batch_desc 在 cudagraph_keys[FULL]:
+  <span class="comment">│  └─</span> return <span style="color:var(--accent-compile);font-weight:600">FULL</span>, batch_desc
+  <span class="comment">│</span>
+  <span class="comment">├─</span> PIECEWISE 被允许:
+  <span class="comment">│  └─</span> 放宽 num_reqs=None, uniform=False
+  <span class="comment">│     如果在 cudagraph_keys[PIECEWISE]
+  <span class="comment">│     └─</span> return <span style="color:var(--accent-capture);font-weight:600">PIECEWISE</span>, relaxed_desc
+  <span class="comment">│</span>
+  <span class="comment">└─</span> return <span class="fn-red">NONE</span>, BatchDescriptor(num_tokens)</div>
+  </div>
+
+  <div class="diagram-title">运行时 Dispatch 时序图</div>
+  <div class="diagram-box mermaid-container">
+    <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant SO as SchedulerOutput
+    participant MR as GPUModelRunner
+    participant CD as CudagraphDispatcher
+    participant AM as Attention Metadata
+    participant MF as Model Forward
+
+    SO->>MR: scheduled tokens
+    MR->>MR: _determine_batch_execution
+    MR->>CD: dispatch()
+    Note right of CD: pad token count<br/>try FULL key<br/>try PIECEWISE key
+    CD-->>MR: mode + BatchDescriptor
+
+    MR->>AM: _get_slot_mappings()
+    MR->>AM: _build_attention_metadata()
+
+    MR->>MF: set_forward_context(mode, batch_desc, metadata)
+    Note right of MF: PIECEWISE: 子图 replay<br/>FULL: 外层 wrapper replay<br/>NONE: eager 执行
+    MF-->>MR: output
+    </pre>
+  </div>
+
+  <div class="diagram-title">FULL 被禁用的运行时场景</div>
+  <div class="diagram-box" style="padding:0;overflow-x:auto">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>场景</th>
+          <th>原因</th>
+          <th>结果</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>cascade attention 启用</td><td>动态 attention 路径</td><td><code>invalid_modes={FULL}</code></td></tr>
+        <tr><td>encoder-decoder 首步</td><td>encoder output 动态路径</td><td>FULL 不适合</td></tr>
+        <tr><td><code>calculate_kv_scales=True</code></td><td>KV scale 包含动态操作</td><td>直接 NONE</td></tr>
+        <tr><td>data parallel</td><td>跨 rank token 数需同步</td><td>可能重 dispatch</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="file-ref">
+    <span class="path">vllm/v1/worker/gpu_model_runner.py</span> execute_model &nbsp;|&nbsp;
+    <span class="path">vllm/v1/cudagraph_dispatcher.py</span> dispatch
+  </div>
+</section>
+
+<!-- ═══════ STAGE 7 ═══════ -->
+<section class="section" id="stage7">
+  <div class="section-label" style="color:var(--accent-dispatch)">Stage 7</div>
+  <div class="section-title">ForwardContext 驱动 Replay</div>
+
+  <div class="diagram-title">ForwardContext 内容</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-dispatch">set_forward_context()</span> <span class="comment">(forward_context.py)</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> attn_metadata         <span class="comment">→ 每层 attention backend 的 metadata</span>
+  <span class="comment">├─</span> slot_mapping          <span class="comment">→ KV cache 写入位置</span>
+  <span class="comment">├─</span> num_tokens            <span class="comment">→ padding 后 token 数</span>
+  <span class="comment">├─</span> num_tokens_across_dp  <span class="comment">→ DP/MoE 场景跨 rank token 数</span>
+  <span class="comment">├─</span> <span style="color:var(--accent-capture);font-weight:600">cudagraph_runtime_mode</span>  <span class="comment">→ NONE / PIECEWISE / FULL</span>
+  <span class="comment">├─</span> <span style="color:var(--accent-dispatch);font-weight:600">batch_descriptor</span>        <span class="comment">→ CUDA Graph key</span>
+  <span class="comment">├─</span> ubatch_slices         <span class="comment">→ DBO / ubatching 切片</span>
+  <span class="comment">└─</span> skip_compiled         <span class="comment">→ 跳过编译模型</span></div>
+  </div>
+
+  <div class="two-col" style="margin:0">
+    <div>
+      <div class="diagram-title" style="color:var(--accent-capture)">PIECEWISE Replay 调用栈</div>
+      <div class="diagram-box" style="margin:0">
+        <div class="callstack"><span class="fn-capture">execute_model()</span>
+  <span class="comment">└─</span> set_forward_context(<span class="fn-capture">PIECEWISE</span>):
+     <span class="comment">└─</span> self.model(...)
+        <span class="comment">├─</span> attention op <span class="comment">(graph 外 eager)</span>
+        <span class="comment">├─</span> <span class="fn-capture">CUDAGraphWrapper(partition 0)</span>
+        <span class="comment">│  └─</span> graph.replay()
+        <span class="comment">├─</span> attention op <span class="comment">(graph 外 eager)</span>
+        <span class="comment">├─</span> <span class="fn-capture">CUDAGraphWrapper(partition 1)</span>
+        <span class="comment">│  └─</span> graph.replay()
+        <span class="comment">└─</span> ...
+        <span class="comment">   num_reqs=None → 同一个 graph 按 token 数匹配</span></div>
+      </div>
+    </div>
+    <div>
+      <div class="diagram-title" style="color:var(--accent-compile)">FULL Replay 调用栈</div>
+      <div class="diagram-box" style="margin:0">
+        <div class="callstack"><span class="fn-compile">execute_model()</span>
+  <span class="comment">└─</span> set_forward_context(<span class="fn-compile">FULL</span>):
+     <span class="comment">└─</span> self.model(...) <span class="comment">← 外层 CUDAGraphWrapper</span>
+        <span class="comment">├─</span> CUDAGraphWrapper.__call__()
+        <span class="comment">├─</span> runtime_mode 匹配 FULL
+        <span class="comment">├─</span> DEBUG: 检查输入地址不变
+        <span class="comment">├─</span> get_offloader().sync_prev_onload()
+        <span class="comment">├─</span> <span style="color:var(--accent-compile);font-weight:600">graph.replay()</span>
+        <span class="comment">└─</span> return captured output
+        <span class="comment">   num_reqs=padded_reqs, uniform=True</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="diagram-title" style="margin-top:24px">Replay 时序图</div>
+  <div class="diagram-box mermaid-container">
+    <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant MR as GPUModelRunner
+    participant FC as ForwardContext
+    participant CW as CUDAGraphWrapper
+    participant GP as CUDA Graph Pool
+    participant AB as Attention Backend
+
+    MR->>FC: set_forward_context()
+    MR->>CW: model(...)
+    CW->>FC: get_forward_context()
+    FC-->>CW: mode + batch_descriptor
+    CW->>CW: mode/key match?
+    CW->>GP: graph.replay()
+    Note right of GP: 已录制的 kernels 一次提交
+    GP->>AB: recorded kernels execute
+    AB-->>GP: done
+    GP-->>CW: output weak refs/buffers
+    CW-->>MR: return output
+    </pre>
+  </div>
+
+  <div class="key-point">
+    PIECEWISE 特点：<code>num_reqs=None</code>，同一个 graph 只按 token 数和 LoRA 状态匹配，不强制 request 数一致。Attention 不在 graph 里，所以它自己的 request/block table 动态性不污染子图。
+  </div>
+
+  <div class="file-ref">
+    <span class="path">vllm/forward_context.py</span> set_forward_context &nbsp;|&nbsp;
+    <span class="path">vllm/compilation/cuda_graph.py</span> CUDAGraphWrapper.__call__
+  </div>
+</section>
+
+<!-- ═══════ STAGE 8 ═══════ -->
+<section class="section" id="stage8">
+  <div class="section-label" style="color:var(--accent-runtime)">Stage 8</div>
+  <div class="section-title">拆分后 Runner 的 ModelCudaGraphManager 路径</div>
+
+  <div style="font-size:13px;color:var(--text-muted);margin-bottom:24px">
+    拆分后的 runner 位于 <code>vllm/v1/worker/gpu/model_runner.py</code>，使用 <code>ModelCudaGraphManager</code> 显式管理 FULL graph。
+  </div>
+
+  <div class="diagram-title">核心数据结构</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-runtime">@dataclass(frozen=True)</span>
+<span class="fn-runtime">BatchExecutionDescriptor</span> <span class="comment">(cudagraph_utils.py)</span>
+  <span class="comment">├─</span> cg_mode: CUDAGraphMode     <span class="comment">→ FULL 还是 PIECEWISE</span>
+  <span class="comment">├─</span> num_tokens: int
+  <span class="comment">├─</span> num_reqs: int | None       <span class="comment">→ PIECEWISE 不需要 request padding</span>
+  <span class="comment">└─</span> uniform_token_count: int | None  <span class="comment">→ 区分 decode / spec decode</span></div>
+  </div>
+
+  <div class="diagram-title">FULL Replay (拆分后路径)</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-runtime">gpu/model_runner.py execute_model(...)</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> dispatch_cg_and_sync_dp(...)
+  <span class="comment">│  └─</span> batch_desc.cg_mode = FULL / PIECEWISE / NONE
+  <span class="comment">│</span>
+  <span class="comment">├─</span> prepare_inputs(...)
+  <span class="comment">├─</span> prepare_attn(...)
+  <span class="comment">│</span>
+  <span class="comment">├─</span> if batch_desc.cg_mode == <span style="color:var(--accent-compile);font-weight:600">FULL</span>:
+  <span class="comment">│  ├─</span> kv_connector.pre_forward(...)
+  <span class="comment">│  └─</span> <span class="fn-runtime">cudagraph_manager.run_fullgraph(batch_desc)</span>
+  <span class="comment">│     ├─</span> get_offloader().sync_prev_onload()
+  <span class="comment">│     ├─</span> <span style="color:var(--accent-compile);font-weight:600">graphs[desc].replay()</span>
+  <span class="comment">│     └─</span> 返回 hidden_states[:desc.num_tokens]
+  <span class="comment">│</span>
+  <span class="comment">└─</span> else:
+     <span class="comment">└─</span> with set_forward_context(...):
+        <span class="comment">└─</span> model(**model_inputs)  <span class="comment">← PIECEWISE 或 eager</span></div>
+  </div>
+
+  <div class="diagram-title">两套 Runner 对应关系</div>
+  <div class="diagram-box" style="padding:0;overflow-x:auto">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>职责</th>
+          <th><code>gpu_model_runner.py</code> 主路径</th>
+          <th><code>worker/gpu/model_runner.py</code> 拆分路径</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td>运行时 key</td><td><code>BatchDescriptor</code></td><td><code>BatchExecutionDescriptor</code></td></tr>
+        <tr><td>dispatch</td><td><code>CudagraphDispatcher.dispatch()</code></td><td><code>CudaGraphManager.dispatch()</code></td></tr>
+        <tr><td>FULL capture</td><td>外层 Wrapper 在 <code>_dummy_run()</code> 中</td><td><code>CudaGraphManager.capture()</code> 显式 <code>torch.cuda.graph()</code></td></tr>
+        <tr><td>FULL replay</td><td><code>CUDAGraphWrapper.__call__()</code></td><td><code>ModelCudaGraphManager.run_fullgraph()</code></td></tr>
+        <tr><td>PIECEWISE</td><td>子图 CUDAGraphWrapper</td><td>子图 CUDAGraphWrapper</td></tr>
+        <tr><td>输入地址保证</td><td>runner 持久化 buffers + ForwardContext</td><td><code>InputBuffers</code> + <code>prepare_inputs_to_capture()</code></td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="key-point">
+    <code>cudagraph_utils.py</code> 的 <code>CudaGraphManager</code> <b>不是</b>主路径的 dispatcher；它属于拆分后的 runner。两者概念相同但对象和调用位置不同。
+  </div>
+
+  <div class="file-ref">
+    <span class="path">vllm/v1/worker/gpu/model_runner.py</span> 拆分 runner &nbsp;|&nbsp;
+    <span class="path">vllm/v1/worker/gpu/cudagraph_utils.py</span> ModelCudaGraphManager
+  </div>
+</section>
+
+<!-- ═══════ STAGE 9 ═══════ -->
+<section class="section" id="stage9">
+  <div class="section-label" style="color:var(--accent-mm)">Stage 9</div>
+  <div class="section-title">多模态 Encoder CUDA Graph</div>
+
+  <div style="font-size:13px;color:var(--text-muted);margin-bottom:24px">
+    独立子系统，主要用于 vision encoder。不使用 <code>BatchDescriptor</code>，而是按 <b>token budget</b> 捕获。
+  </div>
+
+  <div class="diagram-title">数据结构</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-mm">BudgetGraphMetadata</span> <span class="comment">(encoder_cudagraph.py)</span>
+  <span class="comment">├─</span> token_budget
+  <span class="comment">├─</span> max_batch_size
+  <span class="comment">├─</span> max_frames_per_batch
+  <span class="comment">├─</span> graph: torch.cuda.CUDAGraph
+  <span class="comment">├─</span> input_buffer
+  <span class="comment">├─</span> metadata_buffers
+  <span class="comment">└─</span> output_buffer</div>
+  </div>
+
+  <div class="diagram-title">Capture 与 Replay</div>
+  <div class="two-col" style="margin:0">
+    <div class="diagram-box" style="margin:0">
+      <div style="font-size:13px;font-weight:600;color:var(--accent-mm);margin-bottom:8px">Capture 调用栈</div>
+      <div class="callstack"><span class="fn-mm">EncoderCudaGraphManager.capture()</span>
+  <span class="comment">│</span>
+  <span class="comment">└─</span> for token_budget in budgets:
+     <span class="comment">└─</span> _capture_budget_graph(budget)
+        <span class="comment">├─</span> prepare_encoder_cudagraph_capture_inputs(...)
+        <span class="comment">├─</span> output = encoder_cudagraph_forward(...)
+        <span class="comment">├─</span> output_buffer = empty_like(output)
+        <span class="comment">├─</span> <span class="fn-mm">graph = torch.cuda.CUDAGraph()</span>
+        <span class="comment">├─</span> with torch.cuda.graph(graph):
+        <span class="comment">│  ├─</span> output = encoder_cudagraph_forward(...)
+        <span class="comment">│  └─</span> output_buffer.copy_(output)
+        <span class="comment">└─</span> budget_graphs[budget] = Metadata</div>
+    </div>
+    <div class="diagram-box" style="margin:0">
+      <div style="font-size:13px;font-weight:600;color:var(--accent-mm);margin-bottom:8px">Replay 调用栈</div>
+      <div class="callstack"><span class="fn-mm">encoder_cudagraph_manager.execute(mm_kwargs)</span>
+  <span class="comment">│</span>
+  <span class="comment">├─</span> _execute_local(mm_kwargs)
+  <span class="comment">│  ├─</span> 计算每个 item 的 output token 数
+  <span class="comment">│  ├─</span> 按 token 数升序 greedy pack
+  <span class="comment">│  ├─</span> 找 smallest fitting token_budget
+  <span class="comment">│  ├─</span> prepare_encoder_cudagraph_replay_buffers(...)
+  <span class="comment">│  ├─</span> <span class="fn-mm">_run_budget_graph(...)</span>
+  <span class="comment">│  │  ├─</span> copy actual → captured input_buffer
+  <span class="comment">│  │  ├─</span> zero + copy metadata buffers
+  <span class="comment">│  │  ├─</span> <span style="color:var(--accent-compile);font-weight:600">graph.replay()</span>
+  <span class="comment">│  │  └─</span> return output_buffer
+  <span class="comment">│  └─</span> scatter slices → 恢复原始顺序
+  <span class="comment">│</span>
+  <span class="comment">└─</span> mm_encoder_tp_mode == "data":
+     <span class="comment">├─</span> _dp_shard(...)
+     <span class="comment">├─</span> 每个 TP rank 本地 execute
+     <span class="comment">└─</span> _dp_gather(...)</div>
+    </div>
+  </div>
+
+  <div class="diagram-title">Encoder CUDA Graph 时序图</div>
+  <div class="diagram-box mermaid-container">
+    <pre class="mermaid">
+sequenceDiagram
+    autonumber
+    participant MR as GPUModelRunner
+    participant EM as EncoderCudaGraphManager
+    participant MP as Model Protocol
+    participant CG as CUDA Graph
+
+    MR->>EM: _execute_mm_encoder() → execute(mm_kwargs)
+    EM->>EM: get per-item token counts
+    EM->>EM: greedy pack by budget
+    EM->>MP: prepare replay buffers
+    MP-->>EM: buffers ready
+    EM->>EM: copy input/metadata buffers
+    EM->>CG: graph.replay()
+    Note right of CG: 已录制的 encoder forward
+    CG-->>EM: output_buffer
+    EM->>EM: scatter slices → restore order
+    EM-->>MR: MM embeddings
+    </pre>
+  </div>
+
+  <div class="diagram-title">模型侧 SupportsEncoderCudaGraph 协议</div>
+  <div class="diagram-box" style="padding:0;overflow-x:auto">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>方法</th>
+          <th>作用</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr><td><code>get_encoder_cudagraph_config()</code></td><td>返回 encoder CG 配置</td></tr>
+        <tr><td><code>get_encoder_cudagraph_budget_range()</code></td><td>返回支持的 token budget 范围</td></tr>
+        <tr><td><code>prepare_encoder_cudagraph_capture_inputs()</code></td><td>构建 capture 用的假输入</td></tr>
+        <tr><td><code>prepare_encoder_cudagraph_replay_buffers()</code></td><td>构建 replay 用的 buffer 映射</td></tr>
+        <tr><td><code>encoder_cudagraph_forward()</code></td><td>encoder forward (可录制版)</td></tr>
+        <tr><td><code>encoder_eager_forward()</code></td><td>encoder forward (eager 回退)</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="file-ref">
+    <span class="path">vllm/v1/worker/encoder_cudagraph.py</span> EncoderCudaGraphManager &nbsp;|&nbsp;
+    <span class="path">vllm/v1/worker/encoder_cudagraph_defs.py</span> BudgetGraphMetadata
+  </div>
+</section>
+
+<!-- ═══════ CROSS-CUTTING ═══════ -->
+<section class="section" id="crosscut">
+  <div class="section-label" style="color:var(--accent-runtime)">Appendix</div>
+  <div class="section-title">横切关注点</div>
+
+  <div class="two-col">
+    <div class="diagram-box" style="margin:0">
+      <div class="diagram-title" style="color:var(--accent-runtime)">内存池与 Capture 顺序</div>
+      <div style="font-size:12px;color:var(--text-secondary);line-height:1.8">
+        <code style="color:var(--accent-config)">get_global_graph_pool()</code> — 共享的 graph pool<br>
+        Capture 顺序：大尺寸优先、PIECEWISE 先于 FULL<br>
+        <code>lock_workspace()</code> capture 后锁住 workspace<br>
+        避免 runtime resize 破坏 graph 假设
+      </div>
+    </div>
+    <div class="diagram-box" style="margin:0">
+      <div class="diagram-title" style="color:var(--accent-config)">持久化输入 Buffer</div>
+      <div style="font-size:12px;color:var(--text-secondary);line-height:1.8">
+        CUDA Graph replay 要求地址不变，运行时写入已有 buffer：<br>
+        <code>input_ids</code>, <code>positions</code>, <code>seq_lens</code><br>
+        <code>query_start_loc</code>, <code>slot_mapping</code>, block tables<br>
+        非 PP rank 0 的 <code>intermediate_tensors</code>
+      </div>
+    </div>
+  </div>
+
+  <div class="two-col" style="margin-top:16px">
+    <div class="diagram-box" style="margin:0">
+      <div class="diagram-title" style="color:var(--accent-attn)">Attention Padding</div>
+      <div style="font-size:12px;color:var(--text-secondary);line-height:1.8">
+        <b style="color:var(--accent-compile)">FULL</b>：attention 也在 graph 内<br>
+        → metadata 也必须按 padded 形状构建<br>
+        → padding seq_lens 为 0, slot_mapping 填 -1<br><br>
+        <b style="color:var(--accent-capture)">PIECEWISE</b>：attention 在 graph 外<br>
+        → 通常只需要 token padding 给子图
+      </div>
+    </div>
+    <div class="diagram-box" style="margin:0">
+      <div class="diagram-title" style="color:var(--accent-capture)">LoRA Graph Specialization</div>
+      <div style="font-size:12px;color:var(--text-secondary);line-height:1.8">
+        <code>cudagraph_specialize_lora=True</code><br>
+        → 为 0 / 有 LoRA / 各 active count 捕获不同 graph<br><br>
+        <code>cudagraph_specialize_lora=False</code><br>
+        → 用 "max_loras + 1" 的通用 LoRA graph 覆盖
+      </div>
+    </div>
+  </div>
+
+  <div class="two-col" style="margin-top:16px">
+    <div class="diagram-box" style="margin:0">
+      <div class="diagram-title" style="color:var(--accent-dispatch)">Speculative Decoding</div>
+      <div style="font-size:12px;color:var(--text-secondary);line-height:1.8">
+        <code>uniform_decode_query_len = 1 + num_speculative_tokens</code><br>
+        FULL decode graph 的 num_tokens 必须是它的倍数<br>
+        Attention backend 至少要支持 UNIFORM_BATCH<br>
+        否则 FULL decode 会降级
+      </div>
+    </div>
+    <div class="diagram-box" style="margin:0">
+      <div class="diagram-title" style="color:var(--accent-mm)">Offloader 与 Copy Stream</div>
+      <div style="font-size:12px;color:var(--text-secondary);line-height:1.8">
+        Capture 前：<code>sync_prev_onload()</code><br>
+        Capture forward 后：<code>join_after_forward()</code><br>
+        Replay 前：再次 sync<br>
+        → 避免 async copy 和 graph replay 交叉写同一 buffer
+      </div>
+    </div>
+  </div>
+
+  <div class="diagram-box" style="margin-top:16px">
+    <div class="diagram-title" style="color:var(--accent-dispatch)">观测指标</div>
+    <div style="font-size:12px;color:var(--text-secondary);line-height:1.8">
+      <code>observability_config.cudagraph_metrics=True</code> → 生成 <code>CUDAGraphStat</code>：<br>
+      <code>num_unpadded_tokens</code> | <code>num_padded_tokens</code> | <code>num_paddings</code> | <code>runtime_mode</code><br>
+      进入 v1 metrics/logger，便于观察 padding 浪费和 graph 命中模式。
+    </div>
+  </div>
+</section>
+
+<!-- ═══════ READING ORDER ═══════ -->
+<section class="section" id="reading">
+  <div class="section-label" style="color:var(--text-muted)">Appendix</div>
+  <div class="section-title">代码阅读顺序</div>
+
+  <div class="flow-steps" style="max-width:700px">
+    <div class="flow-step">
+      <div class="step-num" style="background:rgba(88,166,255,0.15);color:var(--accent-config)">1</div>
+      <div class="step-content">
+        <div class="step-title">vllm/config/compilation.py</div>
+        <div class="step-desc">CUDAGraphMode、CompilationConfig → resolve_cudagraph_mode_and_sizes()</div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="step-num" style="background:rgba(88,166,255,0.15);color:var(--accent-config)">2</div>
+      <div class="step-content">
+        <div class="step-title">vllm/config/vllm.py</div>
+        <div class="step-desc">_set_cudagraph_sizes() — capture sizes 从 scheduler 上限推导</div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="step-num" style="background:rgba(57,210,192,0.15);color:var(--accent-dispatch)">3</div>
+      <div class="step-content">
+        <div class="step-title">vllm/forward_context.py</div>
+        <div class="step-desc">BatchDescriptor 和 ForwardContext — dispatch 和 wrapper 的桥</div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="step-num" style="background:rgba(188,140,255,0.15);color:var(--accent-capture)">4</div>
+      <div class="step-content">
+        <div class="step-title">vllm/v1/cudagraph_dispatcher.py</div>
+        <div class="step-desc">initialize_cudagraph_keys()、_compute_bs_to_padded_graph_size()、dispatch()</div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="step-num" style="background:rgba(63,185,80,0.15);color:var(--accent-compile)">5</div>
+      <div class="step-content">
+        <div class="step-title">vllm/compilation/cuda_graph.py</div>
+        <div class="step-desc">CUDAGraphWrapper.__call__() — capture/replay 实际行为</div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="step-num" style="background:rgba(63,185,80,0.15);color:var(--accent-compile)">6</div>
+      <div class="step-content">
+        <div class="step-title">vllm/compilation/backends.py + decorators.py</div>
+        <div class="step-desc">wrap_with_cudagraph_if_needed() / maybe_use_cudagraph_partition_wrapper()</div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="step-num" style="background:rgba(57,210,192,0.15);color:var(--accent-dispatch)">7</div>
+      <div class="step-content">
+        <div class="step-title">vllm/v1/worker/gpu_model_runner.py</div>
+        <div class="step-desc">load_model() → capture_model() → execute_model() → _determine_batch_execution_and_padding()</div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="step-num" style="background:rgba(240,136,62,0.15);color:var(--accent-attn)">8</div>
+      <div class="step-content">
+        <div class="step-title">vllm/v1/attention/backend.py</div>
+        <div class="step-desc">AttentionCGSupport — 各 backend 声明支持等级</div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="step-num" style="background:rgba(210,153,34,0.15);color:var(--accent-runtime)">9</div>
+      <div class="step-content">
+        <div class="step-title">拆分后 Runner</div>
+        <div class="step-desc">vllm/v1/worker/gpu/model_runner.py + cudagraph_utils.py — ModelCudaGraphManager</div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="step-num" style="background:rgba(247,120,186,0.15);color:var(--accent-mm)">10</div>
+      <div class="step-content">
+        <div class="step-title">多模态 Encoder</div>
+        <div class="step-desc">vllm/v1/worker/encoder_cudagraph.py + encoder_cudagraph_defs.py</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+</div><!-- end .main -->
+
+<script>
+// Mermaid initialization
+mermaid.initialize({
+  startOnLoad: true,
+  theme: 'dark',
+  themeVariables: {
+    fontFamily: '"Inter", sans-serif',
+    fontSize: '13px',
+    primaryColor: '#1c2128',
+    primaryTextColor: '#e6edf3',
+    primaryBorderColor: '#30363d',
+    lineColor: '#484f58',
+    secondaryColor: '#161b22',
+    tertiaryColor: '#21262d',
+    actorTextColor: '#e6edf3',
+    actorBkg: '#1c2128',
+    actorBorder: '#30363d',
+    actorLineColor: '#30363d',
+    signalColor: '#e6edf3',
+    signalTextColor: '#8b949e',
+    labelBoxBkgColor: '#161b22',
+    labelBoxBorderColor: '#30363d',
+    labelTextColor: '#e6edf3',
+    loopTextColor: '#e6edf3',
+    noteBkgColor: '#1c2128',
+    noteTextColor: '#e6edf3',
+    noteBorderColor: '#30363d',
+    activationBorderColor: '#1f6feb',
+    activationBkgColor: '#1f6feb22',
+    sequenceNumberColor: '#e6edf3',
+  },
+  sequence: {
+    actorMargin: 60,
+    messageMargin: 30,
+    mirrorActors: false,
+    useMaxWidth: false,
+    wrap: true,
+    wrapPadding: 10,
+  },
+  flowchart: {
+    htmlLabels: true,
+    curve: 'basis',
+    useMaxWidth: true,
+  }
+});
+
+// Navigation active state
+const sections = document.querySelectorAll('.section, .hero');
+const navLinks = document.querySelectorAll('.nav a');
+
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(entry => {
+    if (entry.isIntersecting) {
+      const id = entry.target.id;
+      navLinks.forEach(link => {
+        link.classList.toggle('active', link.getAttribute('href') === '#' + id);
+      });
+    }
+  });
+}, { rootMargin: '-20% 0px -60% 0px' });
+
+sections.forEach(section => {
+  if (section.id) observer.observe(section);
+});
+
+// Close mobile nav on link click
+navLinks.forEach(link => {
+  link.addEventListener('click', () => {
+    document.querySelector('.nav').classList.remove('open');
+  });
+});
+</script>
+</body>
+</html>
