@@ -1,0 +1,1403 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>vLLM V1 执行内核：busy loop → spec decode</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+:root {
+  --bg-primary: #0d1117;
+  --bg-secondary: #161b22;
+  --bg-tertiary: #21262d;
+  --border: #30363d;
+  --text-primary: #e6edf3;
+  --text-secondary: #8b949e;
+  --text-muted: #6e7681;
+  --accent-api: #58a6ff;
+  --accent-engine: #3fb950;
+  --accent-worker: #f0883e;
+  --accent-ipc: #d29922;
+  --accent-purple: #bc8cff;
+  --accent-red: #f85149;
+  --accent-cyan: #39d2c0;
+  --font-sans: 'Inter', -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+
+body {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  line-height: 1.6;
+  overflow-x: hidden;
+}
+
+/* ─── Navigation ─── */
+.nav {
+  position: fixed;
+  top: 0; left: 0;
+  width: 260px;
+  height: 100vh;
+  background: var(--bg-secondary);
+  border-right: 1px solid var(--border);
+  padding: 24px 0;
+  overflow-y: auto;
+  z-index: 100;
+  transition: transform 0.3s ease;
+}
+.nav-logo { padding: 0 20px 20px; border-bottom: 1px solid var(--border); margin-bottom: 12px; }
+.nav-logo h2 { font-size: 14px; font-weight: 600; color: var(--text-primary); letter-spacing: 0.5px; }
+.nav-logo span { font-size: 11px; color: var(--text-muted); }
+.nav a {
+  display: block; padding: 7px 20px; font-size: 12px;
+  color: var(--text-secondary); text-decoration: none;
+  transition: all 0.15s; border-left: 2px solid transparent;
+}
+.nav a:hover { color: var(--text-primary); background: rgba(255,255,255,0.04); }
+.nav a.active { color: var(--accent-engine); border-left-color: var(--accent-engine); background: rgba(63,185,80,0.06); }
+.nav .nav-group {
+  padding: 6px 20px 4px; font-size: 10px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); margin-top: 8px;
+}
+.nav .badge {
+  display: inline-block; min-width: 18px; height: 18px; border-radius: 4px;
+  text-align: center; line-height: 18px; font-size: 10px; font-weight: 600;
+  margin-right: 6px; vertical-align: middle; padding: 0 3px;
+}
+.badge-api { background: rgba(88,166,255,0.15); color: var(--accent-api); }
+.badge-engine { background: rgba(63,185,80,0.15); color: var(--accent-engine); }
+.badge-worker { background: rgba(240,136,62,0.15); color: var(--accent-worker); }
+.badge-return { background: rgba(188,140,255,0.15); color: var(--accent-purple); }
+.badge-cross { background: rgba(210,153,34,0.15); color: var(--accent-ipc); }
+
+/* ─── Main Content ─── */
+.main { margin-left: 260px; min-height: 100vh; }
+
+.section { max-width: 1100px; margin: 0 auto; padding: 60px 40px 80px; border-bottom: 1px solid var(--border); }
+.section:last-child { border-bottom: none; }
+.section-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 2px; margin-bottom: 8px; }
+.section-title { font-size: 32px; font-weight: 700; margin-bottom: 32px; line-height: 1.2; }
+
+/* ─── Hero ─── */
+.hero { padding: 120px 40px 80px; text-align: center; border-bottom: 1px solid var(--border); }
+.hero-title {
+  font-size: 44px; font-weight: 700; line-height: 1.15; margin-bottom: 16px;
+  background: linear-gradient(135deg, var(--accent-engine), var(--accent-worker), var(--accent-cyan));
+  -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+}
+.hero-sub { font-size: 18px; color: var(--text-secondary); font-weight: 300; }
+.hero-tags { margin-top: 32px; display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+.hero-tag { display: flex; align-items: center; gap: 8px; padding: 8px 16px; border-radius: 8px; font-size: 13px; font-weight: 500; }
+.hero-tag i { font-style: normal; }
+
+/* ─── Prose ─── */
+.lead { font-size: 15px; color: var(--text-secondary); margin: 16px 0 24px; line-height: 1.7; }
+.lead code, p code, li code {
+  font-family: var(--font-mono); font-size: 12.5px;
+  background: var(--bg-tertiary); padding: 2px 6px; border-radius: 4px; color: var(--accent-api);
+}
+.callout {
+  background: rgba(63,185,80,0.05); border-left: 3px solid var(--accent-engine);
+  padding: 14px 18px; border-radius: 6px; margin: 18px 0; font-size: 13.5px; color: var(--text-secondary);
+}
+.callout.warn { background: rgba(210,153,34,0.05); border-left-color: var(--accent-ipc); }
+.callout strong { color: var(--text-primary); }
+
+/* ─── Diagram Containers ─── */
+.diagram-box {
+  background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 12px;
+  padding: 28px; margin: 20px 0; overflow-x: auto;
+}
+.diagram-box.mermaid-container { padding: 20px; }
+.diagram-caption { font-size: 12px; color: var(--text-muted); margin-top: 12px; font-style: italic; }
+.diagram-title { font-size: 14px; font-weight: 600; color: var(--text-secondary); margin-bottom: 14px; }
+
+/* ─── Call Stack Tree ─── */
+.callstack {
+  font-family: var(--font-mono); font-size: 12.5px; line-height: 2;
+  color: var(--text-secondary); white-space: pre; overflow-x: auto; padding: 8px 0;
+}
+.callstack .fn-api { color: var(--accent-api); font-weight: 500; }
+.callstack .fn-engine { color: var(--accent-engine); font-weight: 500; }
+.callstack .fn-worker { color: var(--accent-worker); font-weight: 500; }
+.callstack .fn-kv { color: var(--accent-cyan); font-weight: 500; }
+.callstack .fn-sampler { color: var(--accent-purple); font-weight: 500; }
+.callstack .fn-spec { color: #d2a8ff; font-weight: 500; }
+.callstack .comment { color: var(--text-muted); }
+.callstack .step { color: var(--accent-ipc); font-weight: 600; }
+.callstack .star { color: var(--accent-red); font-weight: 700; }
+
+/* ─── File Reference ─── */
+.file-ref {
+  font-family: var(--font-mono); font-size: 12px; color: var(--text-muted);
+  padding: 12px 16px; background: rgba(255,255,255,0.02); border-radius: 6px;
+  margin-top: 16px; border: 1px solid rgba(48,54,61,0.5);
+}
+.file-ref .path { color: var(--accent-engine); }
+.file-ref .path-w { color: var(--accent-worker); }
+.file-ref .path-k { color: var(--accent-cyan); }
+.file-ref .path-s { color: var(--accent-purple); }
+.file-ref .line { color: var(--text-muted); }
+
+/* ─── Table ─── */
+.data-table { width: 100%; border-collapse: collapse; font-size: 13px; margin: 16px 0; }
+.data-table th {
+  text-align: left; padding: 10px 12px; font-weight: 600; font-size: 11px;
+  text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted);
+  border-bottom: 1px solid var(--border); background: var(--bg-tertiary);
+}
+.data-table td { padding: 10px 12px; border-bottom: 1px solid rgba(48,54,61,0.5); vertical-align: top; }
+.data-table tr:hover td { background: rgba(255,255,255,0.02); }
+.data-table code { font-family: var(--font-mono); font-size: 12px; color: var(--accent-engine); }
+
+/* ─── Flow Steps ─── */
+.flow-steps { display: flex; flex-direction: column; gap: 4px; }
+.flow-step {
+  display: flex; align-items: flex-start; gap: 12px; padding: 10px 16px;
+  border-radius: 8px; font-size: 13px; background: rgba(255,255,255,0.02);
+}
+.flow-step .step-num {
+  min-width: 28px; height: 28px; border-radius: 6px; display: flex;
+  align-items: center; justify-content: center; font-size: 12px; font-weight: 700;
+  flex-shrink: 0; margin-top: 1px;
+}
+.flow-step .step-content { flex: 1; }
+.flow-step .step-title { font-weight: 600; margin-bottom: 2px; }
+.flow-step .step-desc { font-size: 12px; color: var(--text-secondary); font-family: var(--font-mono); }
+
+/* ─── Mermaid ─── */
+.mermaid { display: flex; justify-content: center; }
+.mermaid svg { max-width: 100%; }
+
+/* ─── Two Column ─── */
+.two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin: 24px 0; }
+@media (max-width: 768px) { .two-col { grid-template-columns: 1fr; } }
+
+/* ─── Loop Badge ─── */
+.loop-badge {
+  display: inline-flex; align-items: center; gap: 6px; padding: 6px 14px;
+  border-radius: 20px; font-size: 12px; font-weight: 600;
+  background: rgba(210,153,34,0.1); color: var(--accent-ipc);
+  border: 1px solid rgba(210,153,34,0.2); margin: 16px 0;
+}
+
+/* ─── Reading list ─── */
+.read-list { counter-reset: rdl; list-style: none; padding: 0; }
+.read-list li {
+  counter-increment: rdl; position: relative; padding: 12px 16px 12px 52px;
+  font-size: 13.5px; color: var(--text-secondary); border-bottom: 1px solid rgba(48,54,61,0.4);
+}
+.read-list li::before {
+  content: counter(rdl); position: absolute; left: 12px; top: 12px;
+  width: 28px; height: 28px; border-radius: 6px; background: rgba(63,185,80,0.15);
+  color: var(--accent-engine); font-weight: 700; font-size: 12px;
+  display: flex; align-items: center; justify-content: center;
+}
+.read-list li strong { color: var(--text-primary); }
+.read-list code { font-family: var(--font-mono); font-size: 11.5px; color: var(--accent-engine); }
+
+/* ─── Responsive ─── */
+@media (max-width: 900px) {
+  .nav { transform: translateX(-100%); }
+  .nav.open { transform: translateX(0); }
+  .main { margin-left: 0; }
+  .hero-title { font-size: 30px; }
+  .section-title { font-size: 24px; }
+  .section { padding: 40px 20px 60px; }
+  .menu-toggle { display: flex !important; }
+}
+.menu-toggle {
+  display: none; position: fixed; top: 12px; left: 12px; z-index: 200;
+  width: 40px; height: 40px; background: var(--bg-secondary); border: 1px solid var(--border);
+  border-radius: 8px; align-items: center; justify-content: center; cursor: pointer;
+  color: var(--text-primary); font-size: 18px;
+}
+
+/* ─── BlockPool State Grid ─── */
+.bp-grid { display:flex; flex-direction:column; gap:11px; font-family:var(--font-mono); }
+.bp-legend { display:flex; gap:16px; flex-wrap:wrap; font-size:11px; color:var(--text-secondary); margin-bottom:4px; align-items:center; }
+.bp-legend .li { display:inline-flex; align-items:center; gap:5px; }
+.bp-legend .sw { display:inline-block; width:14px; height:14px; border-radius:3px; border:1px solid var(--border); }
+.bp-legend .sw.free { background:var(--bg-tertiary); }
+.bp-legend .sw.r1 { background:rgba(63,185,80,0.4); border-color:rgba(63,185,80,0.6); }
+.bp-legend .sw.r2 { background:rgba(240,136,62,0.4); border-color:rgba(240,136,62,0.6); }
+.bp-legend .sw.shared { background:linear-gradient(135deg,rgba(63,185,80,0.45),rgba(240,136,62,0.45)); border-color:rgba(88,166,255,0.6); }
+.bp-legend .sw.lru { background:rgba(210,153,34,0.35); border-color:rgba(210,153,34,0.6); border-style:dashed; }
+.bp-row { display:flex; align-items:center; gap:12px; }
+.bp-label { width:64px; flex-shrink:0; color:var(--accent-engine); font-weight:700; font-size:12px; }
+.bp-cells { display:flex; gap:5px; align-items:center; flex-wrap:wrap; }
+.bp-cells .dots { color:var(--text-muted); font-size:12px; padding:0 2px; }
+.blk { width:40px; height:30px; border-radius:5px; display:flex; align-items:center; justify-content:center; font-size:10px; font-weight:700; border:1px solid var(--border); position:relative; box-sizing:border-box; }
+.blk.free { background:var(--bg-tertiary); color:var(--text-muted); }
+.blk.r1 { background:rgba(63,185,80,0.22); color:var(--accent-engine); border-color:rgba(63,185,80,0.55); }
+.blk.r2 { background:rgba(240,136,62,0.22); color:var(--accent-worker); border-color:rgba(240,136,62,0.55); }
+.blk.shared { background:linear-gradient(135deg,rgba(63,185,80,0.3),rgba(240,136,62,0.3)); color:var(--accent-api); border-color:rgba(88,166,255,0.6); }
+.blk.lru { background:rgba(210,153,34,0.16); color:var(--accent-ipc); border-color:rgba(210,153,34,0.55); border-style:dashed; }
+.blk .cached { position:absolute; top:-5px; right:-3px; color:var(--accent-cyan); font-size:11px; font-weight:700; line-height:1; }
+.bp-note { color:var(--text-muted); font-size:11px; line-height:1.5; flex:1; min-width:200px; }
+</style>
+</head>
+<body>
+
+<div class="menu-toggle" onclick="document.querySelector('.nav').classList.toggle('open')">&#9776;</div>
+
+<!-- ═══════ NAV ═══════ -->
+<nav class="nav">
+  <div class="nav-logo">
+    <h2>vLLM V1 执行内核</h2>
+    <span>busy loop → spec decode 深入</span>
+  </div>
+  <a href="#overview" class="active">全局视角与定位</a>
+  <div class="nav-group">EngineCore 主循环</div>
+  <a href="#busy-loop"><span class="badge badge-engine">&#8635;</span>run_busy_loop</a>
+  <div class="nav-group">step() 四阶段</div>
+  <a href="#schedule"><span class="badge badge-engine">P1</span>schedule + KV cache</a>
+  <a href="#exec"><span class="badge badge-worker">P2</span>model executor</a>
+  <a href="#sampling"><span class="badge badge-return">P3</span>sampling</a>
+  <a href="#spec"><span class="badge badge-cross">P4</span>spec decode</a>
+  <div class="nav-group">附录</div>
+  <a href="#summary">完整时序与数据流转</a>
+  <a href="#reading">代码阅读顺序</a>
+</nav>
+
+<div class="main">
+
+<!-- ═══════ HERO ═══════ -->
+<section class="hero" id="top">
+  <div class="hero-title">vLLM V1 执行内核深入</div>
+  <div class="hero-sub">从 run_busy_loop 到 schedule、KV cache 规划分配、模型运行、sampling 到 spec decode</div>
+  <div class="hero-tags">
+    <span class="hero-tag" style="background:rgba(63,185,80,0.1);color:var(--accent-engine)"><i style="font-size:18px">&#9672;</i> EngineCore</span>
+    <span class="hero-tag" style="background:rgba(39,210,192,0.1);color:var(--accent-cyan)"><i style="font-size:18px">&#9672;</i> KV Cache</span>
+    <span class="hero-tag" style="background:rgba(240,136,62,0.1);color:var(--accent-worker)"><i style="font-size:18px">&#9672;</i> GPU Worker</span>
+    <span class="hero-tag" style="background:rgba(210,153,34,0.1);color:var(--accent-ipc)"><i style="font-size:18px">&#9672;</i> Spec Decode</span>
+  </div>
+  <div style="margin-top:40px; font-size:13px; color:var(--text-muted)">
+    核对基准：vLLM tag <strong style="color:var(--accent-engine)">v0.24.0</strong> (commit ee0da84ab) &nbsp;|&nbsp; request.md 的深入篇
+  </div>
+</section>
+
+<!-- ═══════ OVERVIEW ═══════ -->
+<section class="section" id="overview">
+  <div class="section-label" style="color:var(--text-muted)">Where we zoom in</div>
+  <div class="section-title">全局视角与本文定位</div>
+
+  <p class="lead">本文放大 <code>EngineCore.step()</code> 内部四段——<strong>run busy loop → schedule（含 KV cache 规划与分配）→ model executor / 模型运行 → sampling → spec decode</strong>。所有 <code>file:line</code> 基于 v0.24.0 核对。</p>
+
+  <div class="diagram-title">主干调用链</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-engine">EngineCoreProc.run_busy_loop()</span> <span class="comment">(core.py:1259)</span>
+<span class="comment">  ├─</span> <span class="fn-engine">_process_input_queue()</span> <span class="comment">(core.py:1269)  取 ADD/ABORT/UTILITY，idle 时阻塞</span>
+<span class="comment">  └─</span> <span class="fn-engine">_process_engine_step()</span> <span class="comment">(core.py:1300)</span>
+<span class="comment">       └─</span> <span class="fn-engine">EngineCore.step()</span> <span class="comment">(core.py:479)</span>
+<span class="comment">            ├─</span> <span class="step">Phase 1:</span> <span class="fn-engine">Scheduler.schedule()</span> <span class="comment">(scheduler.py:388)</span>
+<span class="comment">            │     └─</span> <span class="fn-kv">KVCacheManager.allocate_slots()</span> <span class="comment">(kv_cache_manager.py:244)</span>
+<span class="comment">            ├─</span> <span class="step">Phase 2:</span> <span class="fn-worker">model_executor.execute_model(non_block=True)</span> <span class="comment">(core.py:491)</span>
+<span class="comment">            │     └─</span> <span class="fn-worker">GPUModelRunner.execute_model()</span> <span class="comment">(gpu_model_runner.py:4056) → logits 暂存, 返回 None</span>
+<span class="comment">            ├─</span>           <span class="fn-engine">Scheduler.get_grammar_bitmask()</span> <span class="comment">(scheduler.py:1440)  ← 与 GPU forward 并行</span>
+<span class="comment">            ├─</span>           <span class="fn-engine">future.result()</span> <span class="comment">(core.py:497)</span>
+<span class="comment">            ├─</span> <span class="step">Phase 3:</span> <span class="fn-worker">model_executor.sample_tokens()</span> <span class="comment">(core.py:499)</span>
+<span class="comment">            │     └─</span> <span class="fn-sampler">GPUModelRunner.sample_tokens()</span> <span class="comment">(gpu_model_runner.py:4435)</span>
+<span class="comment">            │           ├─</span> apply_grammar_bitmask <span class="comment">(structured_output/utils.py:85)</span>
+<span class="comment">            │           ├─</span> <span class="fn-sampler">Sampler.forward()</span> <span class="comment">(sampler.py:72)</span>
+<span class="comment">            │           ├─</span> <span class="fn-sampler">_bookkeeping_sync()</span> <span class="comment">(gpu_model_runner.py:3613)  ← 唯一 GPU→CPU 同步</span>
+<span class="comment">            │           └─</span> <span class="fn-spec">propose_draft_token_ids()</span> <span class="comment">(gpu_model_runner.py:4864)</span>
+<span class="comment">            └─</span> <span class="step">Phase 4:</span> <span class="fn-engine">Scheduler.update_from_output()</span> <span class="comment">(scheduler.py:1464)</span>
+<span class="comment">                  └─</span> <span class="fn-spec">spec accept/reject + 回退 num_computed_tokens</span></div>
+  </div>
+
+  <div class="diagram-title">三个关键设计决策（后文反复出现）</div>
+  <div class="flow-steps">
+    <div class="flow-step">
+      <div class="step-num" style="background:rgba(210,153,34,0.15);color:var(--accent-ipc)">1</div>
+      <div class="step-content">
+        <div class="step-title">execute_model 与 sample_tokens 刻意拆两次调用</div>
+        <div class="step-desc">execute_model() 只 forward + 暂存 logits 到 execute_model_state，返回 None (gpu_model_runner.py:4417)；sample_tokens() 再取出采样。这让 grammar bitmask 藏在 GPU forward 后面 (core.py:491-492)</div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="step-num" style="background:rgba(188,140,255,0.15);color:var(--accent-purple)">2</div>
+      <div class="step-content">
+        <div class="step-title">采样全程 GPU，唯一同步在 _bookkeeping_sync</div>
+        <div class="step-desc">top-k/top-p 用 FlashInfer 或 Gumbel-max，刻意回避 torch.multinomial（会触发同步）。唯一 GPU→CPU 同步是 _to_list 把 sampled_ids 拷成 Python list (gpu_model_runner.py:7504)</div>
+      </div>
+    </div>
+    <div class="flow-step">
+      <div class="step-num" style="background:rgba(63,185,80,0.15);color:var(--accent-engine)">3</div>
+      <div class="step-content">
+        <div class="step-title">spec decode 复用同一套 token 记账</div>
+        <div class="step-desc">draft token 不是特殊路径，计入 num_tokens_with_spec = prompt + output + spec_token_ids (scheduler.py:390-399)。于是 chunked prefill / prefix cache / spec decode / jump decoding 共用同一套调度</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════ BUSY LOOP ═══════ -->
+<section class="section" id="busy-loop">
+  <div class="section-label" style="color:var(--accent-engine)">EngineCore 主驱动</div>
+  <div class="section-title">run_busy_loop：EngineCore 的主驱动循环</div>
+
+  <div class="diagram-title">进程 / 线程模型 — 三队列 + 两 socket 线程</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-engine">EngineCoreProc 进程</span> <span class="comment">(v1/engine/core.py:896)</span>
+<span class="comment">│</span>
+<span class="comment">├──</span> input_queue   : Queue[(EngineCoreRequestType, Any)]     <span class="comment">core.py:915</span>
+<span class="comment">├──</span> output_queue  : Queue[(client_index, EngineCoreOutputs)] <span class="comment">core.py:916</span>
+<span class="comment">├──</span> aborts_queue  : Queue[list[str]]                        <span class="comment">core.py:226</span>
+<span class="comment">│</span>
+<span class="comment">├──</span> [线程] <span class="fn-engine">process_input_sockets()</span> <span class="comment">(core.py:1484)  ZMQ DEALER ← 前端 ROUTER</span>
+<span class="comment">│     ├─</span> ADD:    msgpack decode + <span class="fn-engine">preprocess_add_request()</span> (mm tensor IPC / Request / grammar_init)
+<span class="comment">│     │        → input_queue.put((ADD, (Request, wave)))</span>
+<span class="comment">│     ├─</span> ABORT:  → aborts_queue.put(ids) <span class="star">+</span> input_queue.put((ABORT, ids))  <span class="comment">急切 + 保序</span>
+<span class="comment">│     └─</span> UTILITY / WAKEUP → input_queue</span>
+<span class="comment">│</span>
+<span class="comment">├──</span> [线程] <span class="fn-engine">process_output_sockets()</span> <span class="comment">(core.py:1589)  ZMQ PUSH → 前端 PULL</span>
+<span class="comment">│     ├─</span> output_queue.get() 阻塞</span>
+<span class="comment">│     ├─</span> msgpack encode (zero-copy 抽 tensor buffer)</span>
+<span class="comment">│     └─</span> ENGINE_CORE_DEAD 哨兵 → 广播后退出</span>
+<span class="comment">│</span>
+<span class="comment">└──</span> [主线程] <span class="fn-engine">run_busy_loop()</span> <span class="comment">(core.py:1259)</span>
+<span class="comment">      while _handle_shutdown():</span>
+<span class="comment">          _process_input_queue()   ← 取输入 / idle 阻塞</span>
+<span class="comment">          _process_engine_step()   ← 跑 step、产出 output</span></div>
+  </div>
+
+  <div class="callout warn"><strong>为什么分线程</strong>：把 ZMQ recv、msgpack decode、多模态 tensor IPC、grammar 初始化等输入侧重活和主调度循环解耦。主循环不直接读 socket，只读进程内 <code>input_queue</code>。ABORT 同时入 <code>aborts_queue</code> 让模型执行期间也能尽早记录 abort，入 <code>input_queue</code> 保证顺序不丢（scheduler abort 幂等，core.py:1579-1584）。</div>
+
+  <div class="diagram-title">run_busy_loop 本体 — core.py:1259</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-engine">_process_input_queue()</span> <span class="comment">(core.py:1269)</span>
+<span class="comment">  ├─</span> while not has_work() and is_running():        <span class="comment">没活且没停机时</span>
+<span class="comment">  │     ├─</span> _notify_idle_state_callbacks()          <span class="comment">通知"引擎空闲"</span>
+<span class="comment">  │     ├─</span> if input_queue.empty(): 清空 aborts_queue
+<span class="comment">  │     └─</span> req = input_queue.get(block=block) → <span class="fn-engine">_handle_client_request(*req)</span>
+<span class="comment">  └─</span> while not input_queue.empty():               <span class="comment">有活后 drain 当前输入</span>
+<span class="comment">        req = input_queue.get_nowait(); _handle_client_request(*req)</span>
+
+<span class="fn-engine">_process_engine_step()</span> <span class="comment">(core.py:1300)</span>
+<span class="comment">  ├─</span> outputs, model_executed = self.step_fn()     <span class="comment">step_fn = step / step_with_batch_queue</span>
+<span class="comment">  ├─</span> for (client_index, eco) in outputs: output_queue.put_nowait(...)</span>
+<span class="comment">  ├─</span> <span class="fn-engine">post_step(model_executed)</span> <span class="comment">(core.py:510)  拉 draft token（同步路径）</span>
+<span class="comment">  └─</span> if not model_executed and scheduler.has_requests(): time.sleep(0.001)  <span class="comment">让出 GIL</span></div>
+  </div>
+  <div class="file-ref">
+    <span class="path">v1/engine/core.py</span><span class="line">:1259</span> run_busy_loop &nbsp;|&nbsp;
+    <span class="path">:1269</span> _process_input_queue &nbsp;|&nbsp;
+    <span class="path">:1300</span> _process_engine_step &nbsp;|&nbsp;
+    <span class="path">:1372</span> _handle_client_request
+  </div>
+
+  <div class="callout"><strong>循环语义</strong>：空闲时阻塞在 <code>input_queue.get(block=True)</code> 等第一个请求；被唤醒后 <code>has_work()</code> 变真，跳出 while 进入 drain 把积压输入全部处理，然后<strong>立刻</strong>进 <code>_process_engine_step()</code>——不等下一个输入。末尾 <code>time.sleep(0.001)</code> 在本步没真跑模型（如 <code>WAITING_FOR_REMOTE_KV</code>）时主动让 GIL，避免饿死后台传输线程。</div>
+
+  <div class="diagram-title">EngineCore.step() 四阶段 — core.py:479</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-engine">step()</span> <span class="comment">(core.py:479)</span>
+<span class="comment">  ├─</span> if not scheduler.has_requests(): return {}, False                    <span class="comment">:488</span>
+<span class="comment">  ├─</span> scheduler_output = <span class="fn-engine">scheduler.schedule(...)</span>                  <span class="comment">:490  Phase 1</span>
+<span class="comment">  ├─</span> future = <span class="fn-worker">model_executor.execute_model(scheduler_output, non_block=True)</span>  <span class="comment">:491  Phase 2 (非阻塞)</span>
+<span class="comment">  ├─</span> grammar_output = <span class="fn-engine">scheduler.get_grammar_bitmask(scheduler_output)</span>           <span class="comment">:492  与 GPU 并行</span>
+<span class="comment">  ├─</span> model_output = future.result()                                         <span class="comment">:497  等 forward</span>
+<span class="comment">  ├─</span> if model_output is None:                                               <span class="comment">:498  execute_model 暂存了 logits</span>
+<span class="comment">  │     model_output = <span class="fn-worker">model_executor.sample_tokens(grammar_output)</span>            <span class="comment">:499  Phase 3</span>
+<span class="comment">  ├─</span> <span class="fn-engine">_process_aborts_queue()</span>                                               <span class="comment">:503  step 之间急切 abort</span>
+<span class="comment">  └─</span> engine_core_outputs = <span class="fn-engine">scheduler.update_from_output(...)</span>                      <span class="comment">:504  Phase 4</span></div>
+  </div>
+
+  <div class="diagram-title">单步时序：busy loop 的一次迭代</div>
+  <div class="diagram-box mermaid-container">
+    <pre class="mermaid">
+sequenceDiagram
+    participant IN as 输入线程
+    participant EC as EngineCoreProc(主线程)
+    participant OUT as 输出线程
+    participant W as Worker/GPU
+
+    IN->>EC: input_queue.put(ADD, req)
+    EC->>EC: _process_input_queue → add_request → waiting
+    EC->>EC: _process_engine_step → step()
+    Note over EC,W: Phase 1: schedule (纯 CPU)
+    EC->>W: schedule 内 allocate_slots (KVCacheManager)
+    Note over EC: Phase 2: execute_model(non_block)
+    EC->>W: execute_model(sched_out)
+    W->>W: _update_states/_prepare_inputs/forward
+    EC->>EC: get_grammar_bitmask() [CPU, 并行]
+    W-->>EC: None (logits 暂存 execute_model_state)
+    EC->>EC: future.result()
+    Note over EC,W: Phase 3: sample_tokens
+    EC->>W: sample_tokens(grammar_output)
+    W-->>EC: ModelRunnerOutput
+    Note over EC: Phase 4: update_from_output
+    EC->>EC: _process_aborts_queue + update_from_output
+    EC->>OUT: output_queue.put(EngineCoreOutputs)
+    EC->>EC: post_step (拉 draft token)
+    OUT-->>OUT: msgpack encode → ZMQ PUSH
+    </pre>
+  </div>
+
+  <table class="data-table">
+    <thead><tr><th>边界</th><th>传输</th><th>数据对象</th></tr></thead>
+    <tbody>
+      <tr><td>输入线程 → 主线程</td><td>进程内 <code>input_queue</code></td><td><code>(EngineCoreRequestType, Request/ids)</code></td></tr>
+      <tr><td>主线程 → 输出线程</td><td>进程内 <code>output_queue</code></td><td><code>(client_index, EngineCoreOutputs)</code></td></tr>
+      <tr><td>EngineCore → Worker</td><td><code>model_executor</code> 跨进程 RPC（multiproc）或同进程（uniproc）</td><td><code>SchedulerOutput</code> 下行 / <code>ModelRunnerOutput</code> 上行</td></tr>
+      <tr><td>EngineCore → 前端</td><td>ZMQ <code>PUSH→PULL</code></td><td><code>EngineCoreOutputs</code>（msgpack）</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn"><strong>DP 注意</strong>：<code>DPEngineCoreProc(EngineCoreProc)</code>（core.py:1745）为数据并行重写 <code>run_busy_loop</code> 与 <code>_handle_client_request</code>，多一条和 DP coordinator 的 XSUB 通道（core.py:1508-1521）。单 DP 读代码可忽略。</div>
+</section>
+
+<!-- ═══════ SCHEDULE ═══════ -->
+<section class="section" id="schedule">
+  <div class="section-label" style="color:var(--accent-engine)">Phase 1</div>
+  <div class="section-title">schedule — 调度与 KV cache 规划分配</div>
+
+  <p class="lead"><code>Scheduler.schedule()</code>（scheduler.py:388）不区分 prefill/decode phase，而用统一 token 记账把 chunked prefill、prefix cache、spec decode 全部纳入。</p>
+
+  <div class="diagram-title">统一记账 — scheduler.py:390-399</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="comment">num_tokens_with_spec = len(prompt) + len(output) + len(spec_token_ids)</span>
+<span class="comment">num_new_tokens       = num_tokens_with_spec + num_output_placeholders - num_computed_tokens</span>
+
+<span class="comment">普通 decode      → spec=[], num_new_tokens = 1</span>
+<span class="comment">chunked prefill  → 被 long_prefill_token_threshold / token_budget 截断，分多步算</span>
+<span class="comment">prefix cache 命中 → 命中 token 计入 num_computed_tokens，num_new_tokens 自动减小</span>
+<span class="comment">spec decode      → spec_token_ids 膨胀 → num_new_tokens = 1 + num_draft</span></div>
+  </div>
+
+  <div class="diagram-title">schedule() 主流程</div>
+  <div class="diagram-box mermaid-container">
+    <pre class="mermaid">
+flowchart TD
+    S(["schedule(throttle_prefills)<br/>scheduler.py:388"]) --> N["kv_cache_manager.new_step_starts()<br/>:422"]
+    N --> R["Phase A: 调度 RUNNING<br/>:430-623"]
+    R --> Calc["num_new_tokens = num_tokens_with_spec<br/>+ num_output_placeholders - num_computed_tokens<br/>:463-467"]
+    Calc --> AllocR["allocate_slots 重试 + 抢占循环<br/>:523-572"]
+    AllocR --> W["Phase B: 调度 WAITING<br/>:625-988"]
+    W --> Hit["get_computed_blocks: prefix 命中<br/>:667-712"]
+    Hit --> AllocW["allocate_slots(全参数)<br/>:866-885"]
+    AllocW --> Fin["收尾: common_prefix_blocks<br/>take_new_block_ids / num_spec_tokens_to_schedule<br/>:1004-1075"]
+    Fin --> Out(["SchedulerOutput<br/>output.py:180"])
+    </pre>
+  </div>
+  <div class="callout"><strong>为什么 RUNNING 在 WAITING 之前</strong>：decode 每步只要 1 token（+draft），延迟敏感且内存小，优先保证在跑的请求不 stall；新 prefill 占内存大放后面，预算/空间不足时自然被推迟。</div>
+
+  <div class="diagram-title">KV cache 三层委托</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-engine">Scheduler</span>
+<span class="comment">  └─</span> <span class="fn-kv">KVCacheManager</span> <span class="comment">(kv_cache_manager.py:110)  对 scheduler 的门面</span>
+<span class="comment">       └─</span> <span class="fn-kv">KVCacheCoordinator</span> <span class="comment">(kv_cache_coordinator.py:61)  抽象基类</span>
+<span class="comment">            │   ├─ NoPrefixCache  (kv_cache_coordinator.py:369)</span>
+<span class="comment">            │   ├─ Unitary        (kv_cache_coordinator.py:419)</span>
+<span class="comment">            │   └─ Hybrid         (kv_cache_coordinator.py:506)  定点迭代找最长命中</span>
+<span class="comment">            ├─</span> <span class="fn-kv">BlockPool</span> <span class="comment">(block_pool.py:144)  空闲链表 + prefix hash 表</span>
+<span class="comment">            └─</span> tuple[<span class="fn-kv">SingleTypeKVCacheManager</span> ...] <span class="comment">(single_type_kv_cache_manager.py:32)</span>
+<span class="comment">                  ├─ FullAttentionManager        :540</span>
+<span class="comment">                  ├─ SlidingWindowManager        :601</span>
+<span class="comment">                  ├─ ChunkedLocalAttentionManager :808</span>
+<span class="comment">                  ├─ MambaManager                :958</span>
+<span class="comment">                  └─ CrossAttentionManager       :1293</span></div>
+  </div>
+  <div class="callout"><strong>注意</strong>：没有 <code>UnifiedKVCacheManager</code>（"unified"是 spec 层概念）；没有 <code>num_blocks_per_alloc</code> 字段——分配粒度恒为 1 block，需几个由 <code>ceil(num_tokens/block_size)</code> 决定。</div>
+
+  <div class="diagram-title">allocate_slots 十步算法 — kv_cache_manager.py:244</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="step">①</span> 算 token 总数                                       <span class="comment">:355-361</span>
+<span class="step">②</span> watermark 门槛（仅 WAITING/PREEMPTED 且已有请求在跑）  <span class="comment">:363-370</span>
+<span class="step">③</span> full_sequence_must_fit 准入检查（WAITING）            <span class="comment">:372-387</span>
+<span class="comment">     n = coordinator.get_num_blocks_to_allocate(apply_admission_cap=True)</span>
+<span class="comment">     if n + watermark_blocks &gt; get_num_free_blocks(): return None</span>
+<span class="step">④</span> remove_skipped_blocks（先回收 SWA/Mamba）             <span class="comment">:400-402</span>
+<span class="step">⑤</span> 重算 num_blocks_to_allocate                          <span class="comment">:404-412</span>
+<span class="step">⑥</span> 空闲容量检查  required &gt; available → return None      <span class="comment">:416-420</span>
+<span class="step">⑦</span> allocate_new_computed_blocks → BlockPool.touch()      <span class="comment">:422-433  命中 block ref_cnt++</span>
+<span class="step">⑧</span> allocate_new_blocks → BlockPool.get_new_blocks(n)     <span class="comment">:435-440  popleft LRU + evict + ref_cnt++</span>
+<span class="step">⑨</span> cache_blocks → cache_full_blocks（写满的入 hash 表）   <span class="comment">:444-456  截断到 num_tokens，draft 不缓存</span>
+<span class="step">⑩</span> return create_kv_cache_blocks(new_blocks)             <span class="comment">:458</span></div>
+  </div>
+  <div class="callout"><strong>block 数怎么算</strong>（single_type_kv_cache_manager.py:132）：<code>num_required_blocks = cdiv(num_tokens, block_size)</code> = ceil。新请求减去已覆盖的 computed/skipped，再加回 evictable（ref_cnt==0 但还在命中表里的）。<strong>没有"部分 block"特殊处理</strong>——最后一个不满的 block 照常分配一个完整 block，只是没写满就不入 hash 表。</div>
+
+  <div class="diagram-title">prefix cache：命中、hash、LRU 生命周期</div>
+  <div class="diagram-box mermaid-container">
+    <pre class="mermaid">
+flowchart LR
+    A["block 写满"] --> B["入 hash 表<br/>cached_block_hash_to_block<br/>hash = H(parent_hash, tokens, extra_keys)"]
+    B --> C["请求结束/抢占 free<br/>ref_cnt=0"]
+    C --> D["仍在 hash 表 +<br/>进空闲链表尾部 (LRU 候选)"]
+    D --> E{"后续请求命中?"}
+    E -->|是| F["get_cached_block 命中<br/>touch: ref_cnt++<br/>复用免重算"]
+    D --> G{"被 get_new_blocks 弹出?"}
+    G -->|是| H["_maybe_evict_cached_block<br/>pop hash + reset_hash<br/>此时才真正淘汰"]
+    H --> I["复用给新内容"]
+    </pre>
+  </div>
+  <div class="callout"><strong>hash 链式</strong>（kv_cache_utils.py:577）：<code>hash = H(parent_block_hash, curr_tokens, extra_keys)</code>，沿前缀链式哈希——每个 block 指纹的是截至该 block 的整条前缀。extra_keys 含多模态 feature、LoRA 名、cache_salt（仅首块）、prompt embeds。命中查找 <code>find_longest_cache_hit</code>：full attention 从左到右逐个查，<strong>第一个 miss 就 break</strong>。</div>
+
+  <div class="diagram-title">free / 回收：ref_cnt 决定去留 — block_pool.py:614</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-kv">BlockPool.free_blocks(blocks)</span> <span class="comment">(逆序 free，链尾先回空闲)</span>
+<span class="comment">  for block in blocks:</span>
+<span class="comment">      block.ref_cnt -= 1</span>
+<span class="comment">      if ref_cnt == 0 and not null:</span>
+<span class="comment">          if block.block_hash is None:  → blocks_without_hash  (纯内存，最该先复用)</span>
+<span class="comment">          else:                         → blocks_with_hash     (仍在 prefix 表，LRU 候选)</span>
+<span class="comment">  free_block_queue.prepend_n(blocks_without_hash)   ← 放到淘汰最前</span>
+<span class="comment">  free_block_queue.append_n(blocks_with_hash)        ← 放到淘汰靠后，但仍可被命中</span></div>
+  </div>
+  <div class="callout"><strong>free vs free+留在 prefix cache</strong>：带 hash 的 block 回空闲链表但<strong>仍留在 hash 表</strong>——它是 LRU 候选，还能服务后续命中，直到被复用时才剥 hash。这也是被抢占请求恢复时常能重新命中自己前缀的原因。<code>ref_cnt==0</code> = "在空闲链表里、可淘汰"。</div>
+
+  <div class="diagram-title">准入 = 返回 None；抢占只有 recompute，无 swap</div>
+  <div class="two-col">
+    <div class="diagram-box" style="margin:0">
+      <div class="diagram-title" style="margin-top:0">准入约定</div>
+      <div class="callstack"><span class="comment">v1 没有 can_fit / MAYBE-NO-YES 枚举</span>
+<span class="comment">allocate_slots 返回:</span>
+<span class="comment">  KVCacheBlocks → 放得下，调度</span>
+<span class="comment">  None          → 放不下</span>
+<span class="comment">    RUNNING → 触发抢占</span>
+<span class="comment">    WAITING → 停止准入</span></div>
+    </div>
+    <div class="diagram-box" style="margin:0">
+      <div class="diagram-title" style="margin-top:0">抢占循环 scheduler.py:523-572</div>
+      <div class="callstack"><span class="comment">while True:</span>
+<span class="comment">  new_blocks = allocate_slots(...)</span>
+<span class="comment">  if new_blocks is not None: break</span>
+<span class="comment">  # 放不下 → 抢占</span>
+<span class="comment">  if PRIORITY:</span>
+<span class="comment">    preempt = max(running, key=priority)</span>
+<span class="comment">  else:</span>
+<span class="comment">    preempt = running.pop()  ← FCFS 抢最新</span>
+<span class="comment">  _preempt_request(preempt)</span>
+<span class="comment">  if preempt == request: break</span></div>
+    </div>
+  </div>
+
+  <div class="callout warn"><strong>v1 没有 SWAP</strong>——grep <code>PreemptionMode</code>/<code>swap_out</code> 在 vllm/v1/core/ 下为零。抢占永远是 <strong>recompute</strong>：<code>_preempt_request</code>（scheduler.py:1107）释放全部 block、<code>num_computed_tokens = 0</code>（:1120）、回 waiting 队列头，重跑时靠幸存的 prefix 命中省一部分。延迟 free（PP/async）走 <code>_free_request_blocks</code>（scheduler.py:2082）暂存 <code>deferred_frees</code>，等 GPU 写完成后 <code>_drain_deferred_frees</code> 真正还回 pool。</div>
+
+  <div class="diagram-title">SchedulerOutput 关键字段 — output.py:180</div>
+  <table class="data-table">
+    <thead><tr><th>字段</th><th>行</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td><code>num_scheduled_tokens</code></td><td>:193</td><td>每请求本步算多少 token（含 draft）</td></tr>
+      <tr><td><code>scheduled_spec_decode_tokens</code></td><td>:200</td><td>每请求本步要验证的 draft token</td></tr>
+      <tr><td><code>num_spec_tokens_to_schedule</code></td><td>:245</td><td>动态 SD 选定的 K</td></tr>
+      <tr><td><code>req_to_block_ids</code></td><td>—</td><td>每请求 KV block id 映射（GPU block_table 来源）</td></tr>
+      <tr><td><code>total_num_scheduled_tokens</code></td><td>—</td><td>step() 用它判断是否"真跑了模型"</td></tr>
+    </tbody>
+  </table>
+  <div class="file-ref">
+    <span class="path">v1/core/sched/scheduler.py</span><span class="line">:388</span> schedule &nbsp;|&nbsp;
+    <span class="path-k">v1/core/kv_cache_manager.py</span><span class="line">:244</span> allocate_slots &nbsp;|&nbsp;
+    <span class="path-k">v1/core/block_pool.py</span><span class="line">:542/:597/:614</span> get_new_blocks/touch/free_blocks &nbsp;|&nbsp;
+    <span class="path">scheduler.py</span><span class="line">:1107</span> _preempt_request
+  </div>
+
+  <div style="height:1px;background:var(--border);margin:40px 0"></div>
+  <div class="diagram-title" style="font-size:18px;color:var(--text-primary);margin-bottom:8px">KV cache 的种类：Full Attention / MLA / SparseMLA / Linear 状态缓存</div>
+  <p class="lead">前面讲的 allocate_slots / prefix cache / 抢占都是<strong>机制</strong>，跟"缓存存什么"无关。<code>KVCacheSpec</code>（每层一份）描述"存什么、block 多大"，<code>SingleTypeKVCacheManager</code> 描述"怎么分配/命中/释放"。spec 决定内容与尺寸，manager 决定调度行为，注册表绑定（<code>single_type_kv_cache_manager.py:1380-1415</code>）。</p>
+
+  <div class="diagram-title">spec 层级（vllm/v1/kv_cache_interface.py）</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-kv">KVCacheSpec</span> <span class="comment">(:96)  block_size = 每 block 的 token 数</span>
+<span class="comment">├──</span> <span class="fn-kv">AttentionSpec</span> <span class="comment">(:160)  num_kv_heads, head_size, dtype</span>
+<span class="comment">│   ├──</span> <span class="fn-kv">FullAttentionSpec</span> <span class="comment">(:205)  基本全注意力；hybrid 关闭时 SWA 也归此</span>
+<span class="comment">│   │   ├──</span> TQFullAttentionSpec <span class="comment">(:341)  三值量化</span>
+<span class="comment">│   │   ├──</span> <span class="fn-spec">MLAAttentionSpec</span> <span class="comment">(:367)  ★ MLA（latent 压缩）</span>
+<span class="comment">│   │   │   └──</span> HiddenStateCacheSpec <span class="comment">(:434)</span>
+<span class="comment">│   │   └──</span> SinkFullAttentionSpec <span class="comment">(:690)  带 sink block</span>
+<span class="comment">│   ├──</span> ChunkedLocalAttentionSpec <span class="comment">(:441)</span>
+<span class="comment">│   ├──</span> <span class="fn-kv">SlidingWindowSpec</span> <span class="comment">(:478)</span>
+<span class="comment">│   │   └──</span> <span class="fn-spec">SlidingWindowMLASpec</span> <span class="comment">(:550)  ★ 滑窗 + MLA 缓存格式</span>
+<span class="comment">│   ├──</span> EncoderOnlyAttentionSpec <span class="comment">(:670)  无 KV cache</span>
+<span class="comment">│   └──</span> CrossAttentionSpec <span class="comment">(:677)</span>
+<span class="comment">└──</span> <span class="fn-spec">MambaSpec</span> <span class="comment">(:629)  ★ 状态缓存（Mamba1/2/Linear/GDN/ShortConv）</span></div>
+  </div>
+
+  <div class="diagram-title">spec → manager 绑定（single_type_kv_cache_manager.py:1420-1467）</div>
+  <table class="data-table">
+    <thead><tr><th>spec</th><th>manager</th><th>缓存内容</th><th>随序列增长</th></tr></thead>
+    <tbody>
+      <tr><td><code>FullAttentionSpec</code></td><td><code>FullAttentionManager</code> (:540)</td><td>每 token 的 K 和 V</td><td>O(seq_len)</td></tr>
+      <tr><td><code>MLAAttentionSpec</code></td><td><code>FullAttentionManager</code></td><td>latent kv_c+k_pe（无 V）</td><td>O(seq_len)，~128× 小</td></tr>
+      <tr><td><code>SlidingWindowSpec</code></td><td><code>SlidingWindowManager</code> (:601)</td><td>K/V，窗口外回收</td><td>O(window)</td></tr>
+      <tr><td><code>SlidingWindowMLASpec</code></td><td><code>SlidingWindowManager</code></td><td>MLA latent + 滑窗</td><td>O(window)</td></tr>
+      <tr><td><code>ChunkedLocalAttentionSpec</code></td><td><code>ChunkedLocalAttentionManager</code> (:808)</td><td>K/V，分块局部</td><td>O(chunk)</td></tr>
+      <tr><td><code>MambaSpec</code></td><td><code>MambaManager</code> (:958)</td><td>固定 state（conv+ssm）</td><td>O(1)/request</td></tr>
+      <tr><td><code>CrossAttentionSpec</code></td><td><code>CrossAttentionManager</code> (:1293)</td><td>encoder K/V</td><td>O(encoder_len)</td></tr>
+    </tbody>
+  </table>
+  <div class="callout"><strong>关键</strong>：MLA 用 <code>FullAttentionManager</code>（没有专门 MLA manager）——分配机制相同（per-token block），只是 block 里装 latent 而非 K/V，尺寸差异封装在 <code>MLAAttentionSpec.real_page_size_bytes</code>。Mamba 用独立 <code>MambaManager</code>，因为它是<strong>状态</strong>而非 per-token。</div>
+
+  <div class="diagram-title" style="color:var(--accent-engine);margin-top:32px">基本情况：Full Attention（per-token K/V）</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="comment">每层一个 KV 张量，shape（flash-attn 后端 flash_attn.py:149）：</span>
+<span class="comment">(num_blocks, 2, block_size, num_kv_heads, head_size)</span>
+<span class="comment">     ↑          ↑    ↑           ↑              ↑</span>
+<span class="comment">  物理block数  K和V  slot数=token数  KV头数      每头维度</span>
+
+<span class="comment">• block_size = slot 数 = 每 block token 数（默认 16，须 16 倍数）</span>
+<span class="comment">• 2 = K 和 V 拼出的维度；一 block(一层) 内存 = block_size × num_kv_heads × (head_size+head_size_v) × dtype</span>
+<span class="comment">  (FullAttentionSpec.real_page_size_bytes, kv_cache_interface.py:323-328)</span>
+<span class="comment">• block_table 跨层共享：token 位置 p、第 L 层 K/V = kv_cache[L][ block_table[p//block_size] ][p%block_size]</span>
+<span class="comment">• 内存 O(seq_len)：max_memory_usage_bytes = cdiv(max_model_len, block_size) × page_size_bytes (:236-244)</span></div>
+  </div>
+  <div class="callout">一个 token 一次 forward 为<strong>每层</strong>都产生一对 K/V——不矛盾：层是张量独立维度，slot 只承担"位置"。block_table 是 block 维的 1D 投影，跨层复用。</div>
+
+  <div class="diagram-title" style="color:var(--accent-engine)">MLA：latent 压缩缓存（DeepSeek-V2/V3）</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="comment">每层每 token 缓存 = kv_c_normed (kv_lora_rank=512) + k_pe (qk_rope_head_dim=64) = 576 元素/token (DSv3)</span>
+<span class="star">★</span> <span class="comment">V 根本不缓存 —— attention 时用 kv_b_proj 上投影从 latent 重建 V</span>
+<span class="comment">cache shape = (num_blocks, block_size, head_size=576), num_kv_heads=1  (mla_attention.py:1216-1223)</span>
+<span class="comment">real_page_size_bytes = storage_block_size × 1 × head_size × dtype —— 没有 2  (kv_cache_interface.py:393-398)</span>
+<span class="comment">写入：concat_and_cache_mla(kv_c_normed, k_pe, kv_cache, slot_mapping)  (v1/attention/backend.py:963-983)</span>
+
+<span class="comment">省多少：DSv3 标准注意力本要 128 头×(128+64)K + 128×128 V；MLA 只存 576 维 latent ≈ 128× 缩减</span>
+
+<span class="comment">absorption（mla_attention.py:696-832）：</span>
+<span class="comment">  decode → forward_mqa 吸收路径：q_nope @ W_UK_T 进 latent 空间做 attention，输出 W_UV 投回 V (:778-832)</span>
+<span class="comment">           ★ decode 不展开 latent 成完整 K/V，省显存省带宽</span>
+<span class="comment">  prefill → forward_mha 展开路径：kv_b_proj(kv_c_normed) 展开成完整 K/V 跑标准 MHA (:2317-2321)</span>
+<span class="comment">  吸收权重在 process_weights_after_loading 预备 (:899-962)</span></div>
+  </div>
+
+  <div class="diagram-title" style="color:var(--accent-engine)">SparseMLA：两种"稀疏"，别混淆</div>
+  <div class="callout"><strong>① SlidingWindowMLASpec</strong>（kv_cache_interface.py:550）："Sliding window attention with MLA cache format"——滑窗注意力 + MLA latent 缓存，窗口外 block 回收。→ <code>SlidingWindowManager</code>。</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="comment">② Top-k 选择稀疏 MLA（DeepSeek V3.2/V4 的 index_topk）——社区常说的 sparse MLA：</span>
+<span class="comment">  独立 indexer 注意力算 query 对所有已缓存 token 的相关度，选 top-index_topk（通常 2048）个位置</span>
+<span class="comment">  (deepseek_v2.py:603-674 Indexer; top-k kernel sparse_attn_indexer.py + csrc/libtorch_stable/topk.cu)</span>
+<span class="comment">  主 MLA attention 只对这 top-k token 做注意力，而非全序列</span>
+<span class="star">★</span> <span class="comment">缓存内容不变 —— 还是同一个 MLA latent 张量；只是 kernel 用 top-k block table gather 2048 个 latent</span>
+<span class="comment">  (v1/attention/backends/mla/*_sparse.py, is_sparse()=True, 只有 forward_mqa)</span>
+<span class="comment">FP8 打包：DSv3.2 656 字节/token, DSv4 584 字节/token (flashmla_sparse.py:65-87,132-144)</span>
+<span class="comment">启用：config 带 index_topk 即 V3.2 (deepseek_v2.py:1243-1253 自动探测); V4 用 model_version="deepseek_v4"</span></div>
+  </div>
+  <div class="callout warn"><strong>一句话</strong>：SparseMLA 的"稀疏"在 attention kernel（只看 top-k token），不在缓存布局——缓存还是 per-token MLA latent，该长还是长（O(seq_len)）。省的是算力/带宽，不是 KV 显存。</div>
+
+  <div class="diagram-title" style="color:var(--accent-engine)">Linear / 状态缓存：Mamba / Linear / GDN（"LinearHybrid"）</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="comment">Mamba/线性是状态空间/递归模型，缓存是固定大小 state，不随 token 增长</span>
+<span class="comment">state = conv_state + ssm_state/temporal_state，shape 与序列长度无关</span>
+<span class="comment">  (mamba_utils.py:162-187, 如 Mamba2 temporal_state=(num_heads/tp, head_dim, state_size) 例 (128,64,128))</span>
+<span class="comment">MambaSpec (kv_cache_interface.py:629): shapes, dtypes, mamba_type(MAMBA1/2/SHORT_CONV/LINEAR/GDN_ATTN), mamba_cache_mode</span>
+<span class="star">★</span> <span class="comment">一个 block = 一份完整 state 快照（不是 block_size 个 token 的 K/V）: page_size_bytes = Σ prod(shape)×dtype (:638-646)</span>
+<span class="comment">线性注意力(linear_attn.py)和 GDN(gdn_attn.py)复用 MambaSpec/MambaManager，靠 mamba_type 区分</span>
+
+<span class="comment">MambaManager (single_type_kv_cache_manager.py:958) 关键差异：</span>
+<span class="comment">  find_longest_cache_hit 从右往左找单个最近命中 state block 就停 (:973-1019) — 只需最新状态</span>
+<span class="comment">  force-defer: 若最新 state block 是别请求本步刚缓存的 → 返回 num_gpu_blocks+1 推迟 (:1121-1129)</span>
+<span class="comment">  align 模式每步每请求至多 1 个新 state block (:1246-1248)</span>
+<span class="comment">  new_step_starts 清 cached_blocks_this_step (:1289-1290) — 只有 MambaManager 有实质 per-step 清理</span></div>
+  </div>
+  <div class="diagram-title">mamba_cache_mode（config.py:417-456 决定）</div>
+  <table class="data-table">
+    <thead><tr><th>模式</th><th>每 request block 数</th><th>含义</th><th>prefix cache</th></tr></thead>
+    <tbody>
+      <tr><td><code>none</code></td><td>1 + num_spec</td><td>只存当前运行 state</td><td>无</td></tr>
+      <tr><td><code>align</code></td><td>2 + num_spec</td><td>当前 state + 1 前驱 block 做 copy 暂存</td><td>有（靠最近 state block）</td></tr>
+      <tr><td><code>all</code></td><td>cdiv(max_model_len, block_size) + num_spec</td><td>每 block 边界存一份 state 快照</td><td>全（像 attention，但每 block 是 state）</td></tr>
+    </tbody>
+  </table>
+  <div class="callout"><strong>内存</strong>：Mamba 层 O(1)/request（none/align）；全注意力层 O(seq_len)。混合模型里 attention 层主导 KV 预算，Mamba 层近乎免费（长上下文尤其明显）。</div>
+
+  <div class="diagram-title" style="color:var(--accent-engine)">混合模型：HybridKVCacheCoordinator</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="comment">一个模型可同时有多种层（Jamba=full+mamba; Gemma3=full+sliding 5:1; LLaMA4=full+chunked-local）</span>
+<span class="comment">由 HybridKVCacheCoordinator (kv_cache_coordinator.py:506) 统一管：</span>
+<span class="comment">  • 分组：相同 spec 的层合并成一个 group (KVCacheGroupSpec, kv_cache_interface.py:864)，每组一个 manager</span>
+<span class="comment">  • 一个共享 BlockPool：所有 group 共用同一空闲链表+hash表 (:91-97,107-120)</span>
+<span class="comment">    block 身份 = (block_hash, group_id) — 同内容在不同 group 是不同条目 → 命中要求所有 group 都命中</span>
+<span class="comment">  • 分配 fan-out：get_num_blocks_to_allocate 各 group 相加 (:130-185); allocate_new_blocks 每组各返一份 (:233-266)</span>
+<span class="comment">  • 命中：定点迭代 find_longest_cache_hit (:622-732) — 各 spec 接受或缩短候选长度，迭代到收敛</span>
+<span class="comment">    为何定点：SWA/chunked-local 命中依赖绝对位置，一个 group 缩短会让另一 group 窗口边界变化 → 必须重查</span>
+<span class="comment">    full attention 最先处理且向下封闭（前缀命中恒成立，只被裁剪），给紧的初始上界 (:584-586)</span>
+<span class="comment">  • 准入 apply_admission_cap 只对 SWA/chunked-local 生效；full/mamba 不裁剪 (:133-145)</span>
+<span class="comment">  • per-step 重置：只有 MambaManager.new_step_starts 有实质工作，其余 no-op (:535-537)</span></div>
+  </div>
+
+  <div class="diagram-title">各类 KV cache 内存与增长对比</div>
+  <table class="data-table">
+    <thead><tr><th>类型</th><th>每 token 缓存内容</th><th>每 block 含</th><th>随序列增长</th><th>命中查找</th></tr></thead>
+    <tbody>
+      <tr><td>Full Attention</td><td>K + V</td><td>block_size token</td><td>O(seq_len)</td><td>左→右最长前缀</td></tr>
+      <tr><td>MLA</td><td>latent kv_c(512)+k_pe(64)=576（无 V）</td><td>block_size token</td><td>O(seq_len)，~128× 小</td><td>左→右最长前缀</td></tr>
+      <tr><td>SparseMLA (top-k)</td><td>同 MLA latent</td><td>block_size token</td><td>O(seq_len)（缓存全存）</td><td>左→右；attention 只看 top-k</td></tr>
+      <tr><td>Sliding Window</td><td>K + V</td><td>block_size token，窗口外回收</td><td>O(window)</td><td>右→左连续窗口</td></tr>
+      <tr><td>Chunked Local</td><td>K + V</td><td>block_size token，块外 null</td><td>O(chunk)</td><td>块内左→右</td></tr>
+      <tr><td>Mamba / Linear / GDN</td><td>固定 state（conv+ssm）</td><td>1 block = 1 state 快照</td><td>O(1)/request</td><td>右→左单个最新</td></tr>
+      <tr><td>Cross Attention</td><td>encoder K/V</td><td>block_size token</td><td>O(encoder_len)</td><td>左→右</td></tr>
+    </tbody>
+  </table>
+
+  <div style="height:1px;background:var(--border);margin:40px 0"></div>
+  <div class="diagram-title" style="font-size:18px;color:var(--text-primary);margin-bottom:8px">把这些对象串起来：一个 E2E 例子</div>
+  <p class="lead">把 <code>KVCacheSpec</code> / <code>BlockPool</code> / <code>SingleTypeKVCacheManager</code> / <code>FullAttentionManager</code> / <code>KVCacheCoordinator</code> / <code>KVCacheManager</code> 用一个端到端例子串清楚。</p>
+
+  <div class="diagram-title">角色（一句话职责）</div>
+  <table class="data-table">
+    <thead><tr><th>对象</th><th>是什么</th><th>一句话</th><th>位置</th></tr></thead>
+    <tbody>
+      <tr><td><code>KVCacheSpec</code></td><td>每层一份的不可变描述</td><td>"这层缓存什么、一个 block 多大字节"</td><td>kv_cache_interface.py:96</td></tr>
+      <tr><td><code>BlockPool</code></td><td>block 仓库</td><td>空闲链表(LRU) + 内容哈希表；所有组共享</td><td>block_pool.py:144</td></tr>
+      <tr><td><code>SingleTypeKVCacheManager</code></td><td>每组一个</td><td>跟踪"这组里每个请求持有哪些 block、哪些已缓存"，实现命中/分配/释放</td><td>single_type_kv_cache_manager.py:32</td></tr>
+      <tr><td><code>FullAttentionManager</code></td><td>上面的具体实现</td><td>全注意力的命中(左→右最长前缀)与分配</td><td>:540</td></tr>
+      <tr><td><code>KVCacheCoordinator</code></td><td>策略对象</td><td>拥有 BlockPool + 一组 manager；跨组协调命中(定点迭代)和分配(fan-out)</td><td>kv_cache_coordinator.py:61</td></tr>
+      <tr><td><code>KVCacheManager</code></td><td>scheduler 的唯一接口</td><td>门面，几乎不存逻辑，全转发给 coordinator</td><td>kv_cache_manager.py:110</td></tr>
+    </tbody>
+  </table>
+
+  <div class="diagram-title">所有权 / 委托链</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-engine">Scheduler</span>
+<span class="comment">  └─</span> <span class="fn-kv">KVCacheManager</span> <span class="comment">(门面)  kv_cache_manager.py:110</span>
+<span class="comment">       └─</span> <span class="fn-kv">KVCacheCoordinator</span> <span class="comment">(策略)  kv_cache_coordinator.py:61</span>
+<span class="comment">            │   1 group → UnitaryKVCacheCoordinator (:419)</span>
+<span class="comment">            │   &gt;1 group → HybridKVCacheCoordinator (:506)</span>
+<span class="comment">            ├─</span> <span class="fn-kv">BlockPool</span> <span class="comment">block_pool.py:144</span>
+<span class="comment">            │    ├─</span> FreeKVCacheBlockQueue  空闲链表(LRU)   <span class="comment">kv_cache_utils.py:179</span>
+<span class="comment">            │    └─</span> BlockHashToBlockMap    内容哈希表        <span class="comment">block_pool.py:34</span>
+<span class="comment">            └─</span> (<span class="fn-kv">SingleTypeKVCacheManager</span>, ...) <span class="comment">每组一个</span>
+<span class="comment">                 └─</span> <span class="fn-kv">FullAttentionManager</span> <span class="comment">single_type_kv_cache_manager.py:540</span>
+<span class="comment">                      └─</span> req_to_blocks[req_id]   本组里该请求持有的 block 列表
+<span class="comment">                      └─</span> num_cached_block[req_id] 其中已写满入表的 block 数</div>
+  </div>
+  <div class="callout">一条记忆线：<strong>scheduler 只认 <code>KVCacheManager</code> → 转发给 <code>coordinator</code> → 对每个 group 调对应的 <code>SingleTypeKVCacheManager</code> → manager 向共享 <code>BlockPool</code> 要/还 block</strong>。<code>KVCacheSpec</code> 不参与运行时——它在加载期就决定了 group 怎么分、manager 用哪个、block 多大。</div>
+
+  <div class="diagram-title" style="color:var(--accent-engine);margin-top:32px">E2E 例子（纯 full-attention，1 group）</div>
+  <div class="callout">设定：32 层全注意力，<code>block_size=16</code>，共 1000 个 block。1 group → <code>Unitary</code> coordinator + 1 个 <code>FullAttentionManager</code>。初始 <code>BlockPool</code>：<code>#0..#999</code> 全空闲，哈希表空。每个 <code>#N</code> 是物理 block id，跨 32 层复用；token <code>t</code> 落在逻辑 block <code>t//16</code>、slot <code>t%16</code>。</div>
+
+  <div class="diagram-title">BlockPool 状态演进图（每格 = 1 个物理 block，block_size=16）</div>
+  <div class="diagram-box">
+    <div class="bp-grid">
+      <div class="bp-legend">
+        <span class="li"><span class="sw free"></span>空闲</span>
+        <span class="li"><span class="sw r1"></span>R1 持有</span>
+        <span class="li"><span class="sw r2"></span>R2 持有</span>
+        <span class="li"><span class="sw shared"></span>⊕ 共享(ref_cnt=2)</span>
+        <span class="li"><span class="sw lru"></span>≈ free 留哈希(LRU)</span>
+        <span class="li"><span style="color:var(--accent-cyan);font-weight:700">∗</span> 写满入哈希表</span>
+        <span class="li" style="color:var(--text-muted)">(无 ∗ = 半满未入表)</span>
+      </div>
+
+      <div class="bp-row"><div class="bp-label">初始</div><div class="bp-cells">
+        <div class="blk free">#0</div><div class="blk free">#1</div><div class="blk free">#2</div><div class="blk free">#3</div><div class="blk free">#4</div><span class="dots">··· #999</span>
+      </div></div>
+
+      <div class="bp-row"><div class="bp-label">Beat 1</div><div class="bp-cells">
+        <div class="blk r1">#0<span class="cached">∗</span></div>
+        <div class="blk r1">#1<span class="cached">∗</span></div>
+        <div class="blk r1">#2</div>
+        <div class="blk free">#3</div><div class="blk free">#4</div><span class="dots">···</span>
+      </div><div class="bp-note">R1 prefill 40 tok → get_new_blocks(3) 弹 #0,#1,#2；#0,#1 写满入表，#2 半满不入</div></div>
+
+      <div class="bp-row"><div class="bp-label">Beat 3</div><div class="bp-cells">
+        <div class="blk r1">#0<span class="cached">∗</span></div>
+        <div class="blk r1">#1<span class="cached">∗</span></div>
+        <div class="blk r1">#2<span class="cached">∗</span></div>
+        <div class="blk r1">#3</div>
+        <div class="blk free">#4</div><span class="dots">···</span>
+      </div><div class="bp-note">decode 到 tok48：#2 写满→入表；tok48 越界→新 #3（Beat 2 无变化）</div></div>
+
+      <div class="bp-row"><div class="bp-label">Beat 4</div><div class="bp-cells">
+        <div class="blk shared">#0<span class="cached">∗</span></div>
+        <div class="blk shared">#1<span class="cached">∗</span></div>
+        <div class="blk r1">#2<span class="cached">∗</span></div>
+        <div class="blk r1">#3</div>
+        <div class="blk r2">#4</div><span class="dots">···</span>
+      </div><div class="bp-note">R2 prefix 命中 #0,#1 → touch ref_cnt 1→2（⊕）；R2 只算 tok32-39 写新 #4，tok0-31 免重算</div></div>
+
+      <div class="bp-row"><div class="bp-label">Beat 5</div><div class="bp-cells">
+        <div class="blk r2">#0<span class="cached">∗</span></div>
+        <div class="blk r2">#1<span class="cached">∗</span></div>
+        <div class="blk lru">#2<span class="cached">∗</span></div>
+        <div class="blk free">#3</div>
+        <div class="blk r2">#4</div><span class="dots">···</span>
+      </div><div class="bp-note">R1 free：#0,#1 ref_cnt 2→1 归 R2；#2 free 留 hash（≈）；#3 半满直接 free</div></div>
+
+      <div class="bp-row"><div class="bp-label">Beat 6</div><div class="bp-cells">
+        <div class="blk lru">#0<span class="cached">∗</span></div>
+        <div class="blk lru">#1<span class="cached">∗</span></div>
+        <div class="blk lru">#2<span class="cached">∗</span></div>
+        <div class="blk free">#3</div>
+        <div class="blk free">#4</div><span class="dots">···</span>
+      </div><div class="bp-note">KV 满→抢占 R2(recompute)：free #0,#1(留hash),#4；R2 回 waiting，重调度可再命中 #0,#1</div></div>
+    </div>
+  </div>
+
+  <div class="diagram-title">要点速记</div>
+  <div class="flow-steps">
+    <div class="flow-step"><div class="step-num" style="background:rgba(63,185,80,0.15);color:var(--accent-engine)">1</div><div class="step-content"><div class="step-title">Beat 1 prefill</div><div class="step-desc">get_computed_blocks 0 命中 → allocate_slots 要 cdiv(40,16)=3 block → get_new_blocks 弹 #0,#1,#2</div></div></div>
+    <div class="flow-step"><div class="step-num" style="background:rgba(63,185,80,0.15);color:var(--accent-engine)">2-3</div><div class="step-content"><div class="step-title">Beat 2-3 decode 增长</div><div class="step-desc">cdiv(n,16)−已持有 多数为 0 → 不分配，写进现有 block 空 slot；每跨 16 边界才 +1 block；写满才入表</div></div></div>
+    <div class="flow-step"><div class="step-num" style="background:rgba(88,166,255,0.15);color:var(--accent-api)">4</div><div class="step-content"><div class="step-title">Beat 4 prefix 命中</div><div class="step-desc">find_longest_cache_hit 命中 #0,#1 → touch → ref_cnt 1→2（共享），R2 的 tok0-31 免重算</div></div></div>
+    <div class="flow-step"><div class="step-num" style="background:rgba(240,136,62,0.15);color:var(--accent-worker)">5</div><div class="step-content"><div class="step-title">Beat 5 free</div><div class="step-desc">ref_cnt 归零才进空闲；带 hash 的 #2 进 LRU 尾但仍可命中；半满的 #3 直接 free</div></div></div>
+    <div class="flow-step"><div class="step-num" style="background:rgba(248,81,73,0.15);color:var(--accent-red)">6</div><div class="step-content"><div class="step-title">Beat 6 抢占</div><div class="step-desc">allocate_slots 返回 None → _preempt_request (scheduler.py:1107, recompute 无 swap)；free 后 prefix 仍可命中</div></div></div>
+  </div>
+
+  <div class="diagram-title">侧栏：hybrid 模型（多 group）哪里不同</div>
+  <div class="diagram-box mermaid-container">
+    <pre class="mermaid">
+flowchart TB
+    POOL["共享 BlockPool<br/>#0 #1 #2 #3 #4 #5 ..."]
+    G0["group0 · full-attn 层<br/>FullAttentionManager<br/>R1 持有 [#0,#1]<br/>hash = H(tokens, group_id=0)"]
+    G1["group1 · sliding-window 层<br/>SlidingWindowManager<br/>R1 持有 [#5,#6]<br/>hash = H(tokens, group_id=1)"]
+    POOL --> G0
+    POOL --> G1
+    classDef pool fill:#1c2128,stroke:#39d2c0,color:#e6edf3,stroke-width:2px;
+    class POOL pool;
+    </pre>
+  </div>
+  <div class="callout"><strong>hash 带 <code>group_id</code></strong>（<code>BlockHashWithGroupId</code>，<code>kv_cache_utils.py:57-66</code>）：同样 token 在两 group 是<strong>不同</strong> key → 一次"命中"要求<strong>所有 group 都命中</strong>。</div>
+  <div class="callout"><strong>命中定点迭代</strong>（<code>find_longest_cache_hit</code> <code>:622-732</code>）：full-attn 左→右给紧上界，sliding 右→左查窗口，任一组缩短就重查，收敛到公共前缀。</div>
+  <div class="callout"><strong>分配 fan-out</strong>：<code>get_num_blocks_to_allocate</code> 两 group 相加；<code>allocate_new_blocks</code> 每组各返一份。同一 R1：group0 持 <code>[#0,#1]</code>、group1 持 <code>[#5,#6]</code>——两份独立 <code>req_to_blocks</code>，但都从同一 <code>BlockPool</code> 取。每层有自己的 KV 张量，但 <strong>block_table 跨层共享</strong>（同串 id 对所有层用）。</div>
+  <div class="callout"><strong>一句话总括</strong>：<code>KVCacheSpec</code>（加载期定 group/manager/block 大小）→ <code>KVCacheManager</code>（门面）→ <code>KVCacheCoordinator</code>（跨组策略）→ <code>SingleTypeKVCacheManager</code>/<code>FullAttentionManager</code>（组内 per-request 记账 + 命中/分配）→ <code>BlockPool</code>（物理 block 的 LRU + 哈希）。六者各管一层，靠委托链串起来。</div>
+</section>
+
+<!-- ═══════ EXEC ═══════ -->
+<section class="section" id="exec">
+  <div class="section-label" style="color:var(--accent-worker)">Phase 2</div>
+  <div class="section-title">model executor → 模型运行</div>
+
+  <p class="lead"><code>model_executor</code> 在 <code>EngineCore.__init__</code> 构造（core.py:123），类型由 <code>Executor.get_class</code>（abstract.py:47）按 backend 选。</p>
+
+  <table class="data-table">
+    <thead><tr><th>backend</th><th>类</th><th>文件:行</th></tr></thead>
+    <tbody>
+      <tr><td><code>uni</code></td><td>UniProcExecutor</td><td><code>uniproc_executor.py:45</code></td></tr>
+      <tr><td><code>mp</code></td><td>MultiprocExecutor</td><td><code>multiproc_executor.py:103</code></td></tr>
+      <tr><td><code>ray</code></td><td>RayDistributedExecutor / RayExecutorV2</td><td><code>ray_executor.py:64</code> / <code>ray_executor_v2.py:218</code></td></tr>
+    </tbody>
+  </table>
+
+  <div class="diagram-title">非阻塞 dispatch — UniProc 调用链</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-engine">EngineCore.step()</span> <span class="comment">(core.py:479)</span>
+<span class="comment">  └─</span> model_executor.<span class="fn-worker">execute_model(sched_out, non_block=True)</span>   <span class="comment">core.py:491</span>
+<span class="comment">       └─</span> <span class="fn-worker">UniProcExecutor.execute_model</span> <span class="comment">uniproc_executor.py:108</span>
+<span class="comment">            └─</span> <span class="fn-worker">collective_rpc(non_block=True)</span> <span class="comment">:111 → :79</span>
+<span class="comment">                 └─</span> run_method(driver_worker, "execute_model", ...)  <span class="comment">:98</span>
+<span class="comment">                      └─</span> <span class="fn-worker">WorkerWrapperBase.execute_model</span> <span class="comment">worker_base.py:346</span>
+<span class="comment">                           └─</span> <span class="fn-worker">Worker.execute_model</span> <span class="comment">gpu_worker.py:836</span>
+<span class="comment">                                └─</span> <span class="fn-worker">GPUModelRunner.execute_model(sched_out, intermediate_tensors)</span>  <span class="comment">gpu_model_runner.py:4056</span></div>
+  </div>
+  <div class="callout"><strong>non_block 语义</strong>：<code>non_block=False</code> → 直接返回 <code>ModelRunnerOutput|None</code>；<code>non_block=True</code> → 返回 <code>Future</code>。基类 <code>Executor.execute_model</code>（abstract.py:221）委托 <code>collective_rpc</code>。Multiproc 把 <code>(method, args, kwargs, output_rank)</code> 4-tuple 写入共享 <code>rpc_broadcast_mq</code>，子进程 <code>WorkerProc.worker_busy_loop</code>（multiproc_executor.py:979）dequeue 执行，仅 output_rank 匹配的 rank 回结果。</div>
+
+  <div class="diagram-title">GPUModelRunner.execute_model 骨架 — gpu_model_runner.py:4056</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-worker">execute_model(scheduler_output, intermediate_tensors=None)</span> <span class="comment">(gpu_model_runner.py:4056)</span>
+<span class="comment">  ├─</span> 守卫：execute_model_state 必须为 None（上次 sample_tokens 已消费）   <span class="comment">:4061</span>
+<span class="comment">  ├─</span> <span class="fn-worker">_update_states(scheduler_output)</span>  <span class="comment">:4098  (def :1127)  移除 finished / 写 block_table / 采样元数据</span>
+<span class="comment">  ├─</span> num_scheduled_tokens_np, max_num_scheduled_tokens               <span class="comment">:4133</span>
+<span class="comment">  ├─</span> <span class="fn-worker">_prepare_inputs(scheduler_output, ...)</span>  <span class="comment">:4140  (def :1889)</span>
+<span class="comment">  │     → (logits_indices, spec_decode_metadata)</span>
+<span class="comment">  │     ★ spec: input = [last_committed, draft_1, …, draft_k]; _calc_spec_decode_metadata (:2750)</span>
+<span class="comment">  ├─</span> <span class="fn-worker">_determine_batch_execution_and_padding(...)</span>  <span class="comment">:4155  (def :3822)  ★ eager/FULL/PIECEWISE 决策</span>
+<span class="comment">  ├─</span> <span class="fn-worker">_build_attention_metadata(...)</span>  <span class="comment">:4267  (def :2216)  max_query_len 覆盖所有 draft 位置</span>
+<span class="comment">  ├─</span> <span class="fn-worker">_preprocess(...)</span>  <span class="comment">:4283  (def :3439)  [有 MM] vision/audio encoder forward → encoder_cache</span>
+<span class="comment">  ├─</span> <span class="fn-worker">_model_forward(...)</span>  <span class="comment">:4332  self.model(...)  Embedding → N×TransformerLayer → Final Norm → Linear → logits</span>
+<span class="comment">  ├─</span> 后处理：logits = compute_logits(hidden[logits_indices])            <span class="comment">:4366</span>
+<span class="comment">  ├─</span> <span class="star">★</span> self.execute_model_state = ExecuteModelState(...)             <span class="comment">:4398-4409</span>
+<span class="comment">  │     (sched_out, logits, spec_decode_metadata, hidden_states, ...)</span>
+<span class="comment">  └─</span> return None  <span class="comment">:4417  ← 不采样！logits 暂存 GPU，等 sample_tokens 取</span></div>
+  </div>
+  <div class="callout"><strong>ExecuteModelState</strong>（NamedTuple，gpu_model_runner.py:405）是把 forward 产物从 <code>execute_model</code> 递到 <code>sample_tokens</code> 的"暂存箱"。初始 None（:899），<code>sample_tokens</code> 取出后立即清空（:4462），保证一次 forward 对应一次采样。<strong>spec decode verify</strong>：draft token 在 <code>_prepare_inputs</code> 被并入输入，<code>logits_indices</code> 指向 <code>[last_committed, draft_1…K]</code>，<code>compute_logits</code> 只算这些位置——一次 forward 验证所有 draft。</div>
+
+  <div class="diagram-title">CUDA Graph 路径</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="comment">决策点：_determine_batch_execution_and_padding (gpu_model_runner.py:3822)</span>
+<span class="comment">  └─ dispatch_cudagraph(num_tokens, disable_full, valid_modes)  :3867</span>
+<span class="comment">       └─ CudagraphDispatcher.dispatch (cudagraph_dispatcher.py:235)</span>
+<span class="comment">            → (CUDAGraphMode, BatchDescriptor)  mode ∈ {NONE, PIECEWISE, FULL}</span>
+<span class="comment">规则：</span>
+<span class="comment">  force_eager → NONE</span>
+<span class="comment">  cascade attention / 有 encoder output → 禁 FULL (:3878)</span>
+<span class="comment">  KV scale 计算 → 强制 NONE (:4297)</span>
+<span class="comment">模型 warmup 时包成 CUDAGraphWrapper / BreakableCUDAGraphWrapper (:5299-5328)</span>
+<span class="comment">forward 时按 cudagraph_runtime_mode + batch_descriptor 选已捕获 graph replay (:4314)</span></div>
+  </div>
+  <div class="file-ref">
+    <span class="path-w">v1/worker/gpu_model_runner.py</span><span class="line">:4056</span> execute_model &nbsp;|&nbsp;
+    <span class="path-w">:1889</span> _prepare_inputs &nbsp;|&nbsp;
+    <span class="path-w">:4398</span> 暂存 execute_model_state &nbsp;|&nbsp;
+    <span class="path">v1/executor/uniproc_executor.py</span><span class="line">:79</span> collective_rpc &nbsp;|&nbsp;
+    <span class="path">v1/worker/gpu_worker.py</span><span class="line">:836</span> Worker.execute_model
+  </div>
+
+  <div style="height:1px;background:var(--border);margin:40px 0"></div>
+  <div class="diagram-title" style="font-size:18px;color:var(--text-primary);margin-bottom:8px">多模态：MM embedding 如何进入 token 序列与 KV cache</div>
+  <p class="lead">API 侧（renderer / <code>BaseMultiModalProcessor</code>）见 <code>request.md</code> Stage 3。本节只讲<strong>引擎侧</strong>。三个要点：</p>
+  <div class="flow-steps">
+    <div class="flow-step"><div class="step-num" style="background:rgba(63,185,80,0.15);color:var(--accent-engine)">a</div><div class="step-content"><div class="step-title">MM embedding 占真实 token 位置 → 真实 KV slot</div><div class="step-desc">没有单独的 vision KV 池</div></div></div>
+    <div class="flow-step"><div class="step-num" style="background:rgba(39,210,192,0.15);color:var(--accent-cyan)">b</div><div class="step-content"><div class="step-title">encoder cache ≠ KV cache</div><div class="step-desc">一个存 vision tower 输出，一个存 attention K/V</div></div></div>
+    <div class="flow-step"><div class="step-num" style="background:rgba(210,153,34,0.15);color:var(--accent-ipc)">c</div><div class="step-content"><div class="step-title">mm_hash 串起 encoder cache 与 prefix cache</div><div class="step-desc">同图免重跑 + 不误共享 KV</div></div></div>
+  </div>
+
+  <div class="diagram-title">数据对象：mm_features / mm_position / mm_hash</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="comment">Request.mm_features: list[MultiModalFeatureSpec]  (v1/request.py:157, ctor :70)</span>
+<span class="comment">MultiModalFeatureSpec (multimodal/inputs.py:302):</span>
+<span class="comment">  data=编码后 MM tensor, modality=image/audio/video/prompt_embeds,</span>
+<span class="comment">  identifier=mm_hash(可能 LoRA 前缀), mm_position=PlaceholderRange, mm_hash=原始 hash</span>
+<span class="comment">PlaceholderRange(offset, length) (inputs.py:119): offset=在 prompt token 序列起始, length=占多少 placeholder token</span>
+<span class="comment">跨进程: EngineCoreRequest.mm_features (engine/__init__.py:96) → Request.from_engine_core_request (request.py:197/209)</span>
+<span class="comment">bridge: input_processor.py:354-368 构造; _get_mm_identifier (:165) 加 LoRA 前缀;</span>
+<span class="comment">       mm_hash 由 MultiModalHasher.hash_kwargs (processing/inputs.py:25) 算</span></div>
+  </div>
+
+  <div class="diagram-title">encoder cache（≠ KV cache）与 encoder 预算</div>
+  <table class="data-table">
+    <thead><tr><th></th><th>KV cache</th><th>encoder cache</th></tr></thead>
+    <tbody>
+      <tr><td>存什么</td><td>attention 的 K/V block</td><td>vision/audio tower 输出 embedding</td></tr>
+      <tr><td>存哪</td><td><code>self.kv_caches</code> (gpu_model_runner.py:527)</td><td>scheduler 侧 <code>EncoderCacheManager</code> (encoder_cache_manager.py:17, 只记账) + worker 侧 <code>self.encoder_cache: dict[str,Tensor]</code> (:536, 真存)</td></tr>
+      <tr><td>key</td><td>(block_hash, group_id)</td><td>mm_hash / identifier</td></tr>
+      <tr><td>随什么长</td><td>O(seq_len)</td><td>O(MM item 数)，每图一份</td></tr>
+    </tbody>
+  </table>
+  <div class="diagram-box">
+    <div class="callstack"><span class="comment">encoder_compute_budget = max_num_encoder_input_tokens (scheduler.py:415, :218-220)</span>
+<span class="comment">_try_schedule_encoder_inputs (scheduler.py:1280) 决定本步 encode 哪些 MM item：</span>
+<span class="comment">  get_mm_features_in_window 找窗口内 MM feature</span>
+<span class="comment">  for 每个重叠 MM feature i:</span>
+<span class="comment">    if identifier 已本步 scheduled: skip</span>
+<span class="comment">    if check_and_update_cache(mm_hash) 命中: skip  ★ encoder cache 命中 → 跳过 vision tower (:1362)</span>
+<span class="comment">    if can_allocate(req,i,budget) 失败: clamp num_new_tokens 到 MM item 前 / 设 0, break (:1383)</span>
+<span class="comment">    else: encoder_compute_budget -= num_encoder_embeds (:1429); encoder_inputs_to_schedule.append(i)</span>
+<span class="comment">scheduled_encoder_inputs: dict[str,list[int]] (output.py:204)</span>
+<span class="comment">free_encoder_mm_hashes (scheduler.py:1073): scheduler 淘汰的 mm_hash → worker encoder_cache.pop (gpu_model_runner.py:1159-1160)</span>
+<span class="star">★</span> <span class="comment">chunked prefill + 图: 图像只在 token 窗口到达其 placeholder 范围时 encode; 跨 chunk 已 encode 的跳过 → vision tower 每图只跑一次</span></div>
+  </div>
+
+  <div class="diagram-title">worker 侧：_preprocess 跑 encoder + 合并 embedding</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-worker">_preprocess(scheduler_output)</span> <span class="comment">(gpu_model_runner.py:3439)  MM 门控 :3460</span>
+<span class="comment">  ├─</span> <span class="fn-worker">_execute_mm_encoder(scheduler_output)</span> <span class="comment">(:2892 / 调用 :3466)</span>
+<span class="comment">  │    ├─</span> _batch_mm_inputs_from_scheduler <span class="comment">(:2849)  遍历 scheduled_encoder_inputs → mm_kwargs + mm_hashes</span>
+<span class="comment">  │    ├─</span> group_and_batch_mm_kwargs 按 modality 分组
+<span class="comment">  │    ├─</span> [可选] encoder_cudagraph_manager.execute <span class="comment">(:3079)  ← encoder 自己的 cuda graph</span>
+<span class="comment">  │    │    否则 model.embed_multimodal(**mm_kwargs_batch) <span class="comment">(:3086)  ← vision/audio tower forward</span>
+<span class="comment">  │    └─</span> self.encoder_cache[mm_hash] = output <span class="comment">(:3094)  ★ 存 vision embedding</span>
+<span class="comment">  ├─</span> <span class="fn-worker">_gather_mm_embeddings(scheduler_output)</span> <span class="comment">(:3101 / 调用 :3467)</span>
+<span class="comment">  │    ├─</span> is_mm_embed = zeros(total_num_scheduled_tokens, bool) <span class="comment">(:3109)  标记哪些 token 放 MM embedding</span>
+<span class="comment">  │    ├─</span> get_mm_features_in_window 找本步窗口内 MM feature
+<span class="comment">  │    ├─</span> encoder_cache.get(mm_hash) 取 embedding <span class="comment">(:3154)  miss 抛 RuntimeError (:3164)</span>
+<span class="comment">  │    └─</span> is_mm_embed[切片] = True <span class="comment">(:3175)</span>
+<span class="comment">  └─</span> model.embed_input_ids(input_ids, mm_embeds, is_multimodal=is_mm_embed) <span class="comment">(:3485/3497, interface interfaces.py:375)</span>
+<span class="comment">       ├─</span> _embed_text_input_ids 算文本 embedding <span class="comment">(MM placeholder 若 OOV 先 mask 成 id 0)</span>
+<span class="comment">       └─</span> _merge_multimodal_embeddings(inputs_embeds, mm_embeds, is_multimodal) <span class="comment">(models/utils.py:479)</span>
+<span class="comment">            └─</span> <span class="star">★</span> inputs_embeds[is_multimodal] = mm_embeds_flat <span class="comment">(:500)  scatter: placeholder 位置覆盖成 vision embedding</span></div>
+  </div>
+
+  <div class="callout"><strong>MM embedding 占的是真实 KV slot</strong>：PlaceholderRange 的 length 个位置在 input_ids 是 placeholder token；<code>_merge_multimodal_embeddings</code> 把这些位置 inputs_embeds 覆盖成 vision embedding；decoder forward (<code>_model_forward</code> :4332) 对所有位置（含 MM 位置）算 K/V，写进 <code>allocate_slots</code> 分配的 KV slot。<strong>decoder-attention VL 模型没有"vision KV"独立池</strong>——MM 位置和文本位置一样占 KV slot，只 embedding 来源不同。只有 encoder-decoder 模型才把 encoder 输出单独放（cross-attention）。</div>
+
+  <div class="diagram-title">mm_hash 串起 encoder cache 与 prefix cache</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="comment">_gen_mm_extra_hash_keys (v1/core/kv_cache_utils.py:431):</span>
+<span class="comment">  对每个 block, 找 token 范围 [start, end) 内重叠的 MM feature</span>
+<span class="comment">  append (mm_feature.identifier, offset - start_token_idx)  (:482)  作为 block hash extra key</span>
+<span class="comment">  → generate_block_hash_extra_keys (:539) 与 LoRA/cache_salt/prompt_embeds 合并进 block hash</span>
+
+<span class="comment">为什么：同样文本但不同图（或同图不同位置）的 KV 不能共享</span>
+<span class="comment">  identifier 区分图; offset - start_token_idx 区分同图在不同 block 相对位置</span>
+<span class="comment">identifier = mm_hash(可能 LoRA 前缀)，同时是 encoder cache 的 key</span>
+<span class="comment">  (encoder_cache_manager.py:109, gpu_model_runner.py:3094/3154)</span>
+<span class="star">★</span> <span class="comment">同图 → encoder cache 命中(跳过 vision tower) + block hash 贡献相同(可共享前缀 KV)</span>
+<span class="star">★</span> <span class="comment">异图 → 重跑 encoder + block hash 不同(不误共享 prefix KV)</span></div>
+  </div>
+
+  <div class="diagram-title">CUDA graph 与 MM</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="comment">• encoder forward 在 decoder cuda graph 之外：_execute_mm_encoder 在 _preprocess (:3466)，</span>
+<span class="comment">  早于 _model_forward (:4332)，不在 set_forward_context/CUDAGraphWrapper 范围 (:4314-4338)。encoder 形状可变。</span>
+<span class="comment">• encoder 自己有可选 cuda graph：encoder_cudagraph_manager (:540, encoder_cudagraph.py:53)，</span>
+<span class="comment">  按 budget 捕获，仅支持部分 modality (supports_modality, encoder_cudagraph.py:203)，不支持则 eager。</span>
+<span class="comment">• decoder forward 看到的是合并好的 inputs_embeds（统一张量，MM 位置已覆盖），对 MM 位置一视同仁算 K/V</span>
+<span class="comment">  → decoder cuda graph 不需为 MM 特化。</span>
+<span class="comment">• encoder-decoder 模型: 有 encoder input 时 skip_compiled=has_encoder_output (:4324)，强制不走 compiled/cuda graph。</span></div>
+  </div>
+</section>
+
+<!-- ═══════ SAMPLING ═══════ -->
+<section class="section" id="sampling">
+  <div class="section-label" style="color:var(--accent-purple)">Phase 3</div>
+  <div class="section-title">sampling — 从 logits 到 token</div>
+
+  <div class="diagram-title">sample_tokens 全流程 — gpu_model_runner.py:4435</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-sampler">sample_tokens(grammar_output)</span> <span class="comment">(gpu_model_runner.py:4435)  @torch.inference_mode</span>
+<span class="comment">  ├─</span> if execute_model_state is None: return with_kv_conn_output_only(...)   <span class="comment">:4438  本 rank 无 forward</span>
+<span class="comment">  ├─</span> 解包 execute_model_state → logits, spec_decode_metadata, ...            <span class="comment">:4449</span>
+<span class="comment">  ├─</span> execute_model_state = None                                              <span class="comment">:4462</span>
+<span class="comment">  ├─</span> [结构化] <span class="fn-sampler">apply_grammar_bitmask(...)</span>  原地改 logits: 禁用 token → -inf   <span class="comment">:4465</span>
+<span class="comment">  ├─</span> sampler_output = <span class="fn-sampler">_sample(logits, spec_decode_metadata)</span>     <span class="comment">:4471  (def :3582)</span>
+<span class="comment">  │     ├─</span> [无 spec] self.sampler(logits, sampling_metadata)</span>
+<span class="comment">  │     └─</span> [有 spec] self.rejection_sampler(spec_decode_metadata, ...)</span>
+<span class="comment">  ├─</span> _update_states_after_model_execute(...)                                 <span class="comment">:4473</span>
+<span class="comment">  ├─</span> [spec] <span class="fn-spec">propose_draft_token_ids(...)</span>                            <span class="comment">:4493-4507 / :4606</span>
+<span class="comment">  ├─</span> <span class="fn-sampler">_bookkeeping_sync(...)</span>  ★ 唯一 GPU→CPU 同步                       <span class="comment">:4586  (def :3613)</span>
+<span class="comment">  └─</span> return ModelRunnerOutput（同步）/ AsyncGPUModelRunnerOutput（异步）      <span class="comment">:4637</span></div>
+  </div>
+
+  <div class="diagram-title">grammar bitmask — 与 forward 并行的设计</div>
+  <div class="callout"><strong>为什么拆分</strong>：<code>step()</code> 在 <code>execute_model(non_block=True)</code> 后立刻调 <code>get_grammar_bitmask()</code>（core.py:491-492）。xgrammar FSM 遍历是纯 CPU 工作，被藏到 GPU forward 后面；等 <code>future.result()</code> 回来，bitmask 已算好。</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-engine">Scheduler.get_grammar_bitmask()</span> <span class="comment">(scheduler.py:1440)</span>
+<span class="comment">  └─</span> StructuredOutputManager.<span class="fn-sampler">grammar_bitmask()</span> <span class="comment">(structured_output/__init__.py:204)</span>
+<span class="comment">       ├─</span> allocate_token_bitmask(B*(1+K), ceil(vocab/32))  int32            <span class="comment">:224</span>
+<span class="comment">       ├─</span> [并行] 请求数 &gt; 128 且无 spec: 分 16 一组丢线程池                  <span class="comment">:236-262</span>
+<span class="comment">       └─</span> [串行] 有 spec: 沿 draft 位置逐个 fill + accept + rollback         <span class="comment">:263-294</span>
+<span class="comment">  → numpy 数组（跨进程序列化便宜）</span>
+
+<span class="fn-sampler">apply_grammar_bitmask()</span> <span class="comment">(structured_output/utils.py:85)</span>
+<span class="comment">  ├─</span> 重排：每请求占 (1 + num_spec_tokens) 行 logits（K draft + 1 bonus）   <span class="comment">:112-140</span>
+<span class="comment">  ├─</span> sorted_bitmask = full(-1) 默认全允许，按重排拷贝行</span>
+<span class="comment">  ├─</span> grammar_bitmask.to(device, non_blocking=True)  异步 H2D                <span class="comment">:143</span>
+<span class="comment">  ├─</span> index_tensor = async_tensor_h2d(...)  ★ 预先 H2D 避免 xgrammar 内部 sync  <span class="comment">:156</span>
+<span class="comment">  └─</span> xgr.apply_token_bitmask_inplace(logits, bitmask, indices=index_tensor) <span class="comment">:160  GPU 原地: bit=0 → -inf</span></div>
+  </div>
+
+  <div class="diagram-title">Sampler.forward 采样流水线 — sampler.py:72</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-sampler">Sampler.forward(logits, sampling_metadata)</span> <span class="comment">(sampler.py:72)</span>
+<span class="comment">  ├─</span> [需 logprobs] 算 raw_logprobs（用原始 logits，penalty/temp 之前，与 v0 不同）  <span class="comment">:84</span>
+<span class="comment">  ├─</span> logits = logits.to(float32)                                                <span class="comment">:96</span>
+<span class="comment">  ├─</span> <span class="fn-sampler">apply_logits_processors(...)</span>  (def :371)  全 GPU:</span>
+<span class="comment">  │     1. allowed_token_ids 白名单 (masked_fill_ -inf)            :396</span>
+<span class="comment">  │     2. bad_words                                            :400</span>
+<span class="comment">  │     3. 非 argmax 不变: MinTokens / LogitBias                  :404</span>
+<span class="comment">  │     4. penalties: repetition+frequency+presence 一起          :408</span>
+<span class="comment">  ├─</span> <span class="fn-sampler">sample(...)</span>  (def :243):</span>
+<span class="comment">  │     5. greedy_sample = argmax(dim=-1)  提前算好供 torch.where 混用   :260</span>
+<span class="comment">  │     6. apply_temperature  logits.div_(temp)                        :276</span>
+<span class="comment">  │     7. argmax 不变: MinP (softmax→max_prob×min_p 阈值)             :282</span>
+<span class="comment">  │     8. topk_topp_sampler (top-k / top-p 选 token)                  :286</span>
+<span class="comment">  │     9. torch.where(temp&lt;1e-5, greedy, random) 按行选               :296</span>
+<span class="comment">  └─</span> return SamplerOutput(sampled_token_ids, logprobs_tensors)</span></div>
+  </div>
+
+  <div class="diagram-title">避免 multinomial：Gumbel-max / FlashInfer</div>
+  <div class="callout"><strong>为什么不用 <code>torch.multinomial</code></strong>（topk_topp_sampler.py:446 docstring）：multinomial 触发 CPU-GPU 同步。v1 改用 <strong>Gumbel-max trick</strong>（sample_with_exponential_noise，:437）：<code>q ~ Exponential(1); sampled = (probs/q).argmax(dim=-1)</code> 全程 GPU。CUDA+FlashInfer 走 <code>top_p_sampling_from_probs</code>（内部 rejection sampling 免排序），返回 int32（故 forward 在 :109 转 int64）。greedy 就是 <code>argmax</code>，纯 GPU 无同步。</div>
+
+  <div class="diagram-title">_bookkeeping_sync — 唯一的 GPU→CPU 同步 — gpu_model_runner.py:3613</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-sampler">_bookkeeping_sync(...)</span> <span class="comment">(gpu_model_runner.py:3613)</span>
+<span class="comment">  ├─</span> [VLLM_COMPUTE_NANS_IN_LOGITS] _get_nans_in_logits                          <span class="comment">:3629</span>
+<span class="comment">  ├─</span> 丢弃请求：回退 RNG generator offset 4 字节，保种子确定性                    <span class="comment">:3633</span>
+<span class="comment">  ├─</span> [同步路径]                                                                  <span class="comment">:3652-3686</span>
+<span class="comment">  │     ├─</span> max_gen_len==1 (无 spec): valid_sampled_token_ids = <span class="fn-sampler">_to_list(...)</span>  <span class="comment">:3672  ★ 同步点</span>
+<span class="comment">  │     ├─</span> 有 logprobs: logprobs_tensors.tolists()  (已同步, .cpu() 几乎免费)</span>
+<span class="comment">  │     └─</span> max_gen_len&gt;1 (spec): RejectionSampler.parse_output(...)              <span class="comment">:3681</span>
+<span class="comment">  └─</span> [异步路径] 不在此同步，D2H 推迟到 AsyncGPUModelRunnerOutput.get_output</span>
+
+<span class="fn-sampler">_to_list()</span> <span class="comment">(gpu_model_runner.py:7504)</span>
+<span class="comment">  ├─</span> 拷 sampled_token_ids (GPU int32) → pinned CPU buffer (non_blocking)</span>
+<span class="comment">  ├─</span> copy stream 记 transfer_event + event.synchronize()</span>
+<span class="comment">  └─</span> return pinned.tolist()  ★ 避免 .tolist() 触发整 stream 同步 (issue #22754)</span></div>
+  </div>
+  <div class="callout"><strong>为什么只有这一个同步</strong>：argmax/softmax/topk/masked_fill/gumbel-max/FlashInfer 全是 GPU op 返回 GPU tensor。sampled id 必须变 Python int 才能更新 CPU 侧 <code>token_ids_cpu</code> 并序列化进 <code>ModelRunnerOutput.sampled_token_ids: list[list[int]]</code> 跨进程给 scheduler。这个不可避免的物化被收口在 <code>_to_list</code> 的一次 event 同步里；logprobs 的 <code>.cpu()</code> 搭便车。</div>
+
+  <div class="file-ref">
+    <span class="path-s">v1/sample/sampler.py</span><span class="line">:72</span> forward &nbsp;|&nbsp;
+    <span class="path-s">:371</span> apply_logits_processors &nbsp;|&nbsp;
+    <span class="path-w">v1/worker/gpu_model_runner.py</span><span class="line">:4435</span> sample_tokens &nbsp;|&nbsp;
+    <span class="path-w">:3613/:7504</span> _bookkeeping_sync/_to_list &nbsp;|&nbsp;
+    <span class="path-s">v1/structured_output/utils.py</span><span class="line">:85</span> apply_grammar_bitmask
+  </div>
+</section>
+
+<!-- ═══════ SPEC DECODE ═══════ -->
+<section class="section" id="spec">
+  <div class="section-label" style="color:var(--accent-ipc)">Phase 4 → spec decode</div>
+  <div class="section-title">从 sampling 到 draft 验证</div>
+
+  <p class="lead">spec decode 是 <strong>propose → verify → accept/reject</strong> 的跨步循环，复用前文所有机制：draft 计入 <code>num_tokens_with_spec</code>、走 <code>allocate_slots</code>、一次 <code>execute_model</code> 验证、<code>RejectionSampler</code> 判定、<code>update_from_output</code> 回滚。</p>
+
+  <div class="diagram-title">总体架构：跨步循环</div>
+  <div class="diagram-box mermaid-container">
+    <pre class="mermaid">
+flowchart TD
+    A["step N-1: sample_tokens()"] --> B["propose_draft_token_ids()<br/>(gpu_model_runner.py:4864)<br/>draft model forward → draft_token_ids"]
+    B --> C["post_step → update_draft_token_ids<br/>(scheduler.py:1900)<br/>→ request.spec_token_ids"]
+    C --> D["step N: schedule()<br/>draft 计入 num_tokens_with_spec<br/>→ num_new_tokens = 1 + K<br/>(scheduler.py:463-467, 582-594)"]
+    D --> E["execute_model() [verify]<br/>input = [last_committed, draft_1…K]<br/>一次 forward 算所有位置 logits<br/>(gpu_model_runner.py:4332)"]
+    E --> F["sample_tokens()<br/>RejectionSampler: find-first-mismatch + bonus<br/>(rejection_sampler.py:88)"]
+    F --> G["update_from_output()<br/>num_accepted / num_rejected<br/>num_computed_tokens -= num_rejected (回滚)<br/>(scheduler.py:1464, 1556-1564)"]
+    G --> A
+    </pre>
+  </div>
+
+  <div class="diagram-title">propose 阶段 — gpu_model_runner.py:4864</div>
+  <div class="callout"><code>sample_tokens</code> 末尾闭包 <code>propose_draft_token_ids</code>（:4493）按 proposer 类型决定在 bookkeeping 前/后调：<strong>GPU-token 路径</strong>（EAGLE/draft/extract_hidden/ngram_gpu）在 <code>_bookkeeping_sync</code> <strong>之前</strong>调，吃 GPU <code>sampled_token_ids</code>，省一次 D2H；<strong>CPU-token 路径</strong>（ngram/suffix/medusa）在 bookkeeping <strong>之后</strong>调，吃 CPU list。model-based 的 draft forward 不在单独 runner，而在 proposer 内：<code>SpecDecodeBaseProposer.propose</code>（llm_base_proposer.py:443）跑 <code>self.model(...)</code>（首 pass :524，多步循环 :613-681）。</div>
+
+  <div class="diagram-title">proposer 后端一览</div>
+  <table class="data-table">
+    <thead><tr><th>后端</th><th>类 (file:line)</th><th>类型</th><th>生成 draft 的方式</th></tr></thead>
+    <tbody>
+      <tr><td>ngram</td><td><code>NgramProposer</code> (ngram_proposer.py:12)</td><td>查表无模型</td><td>CPU/numba 最长后缀 n-gram 匹配</td></tr>
+      <tr><td>ngram_gpu</td><td><code>NgramProposerGPU</code> (ngram_proposer_gpu.py:28)</td><td>查表无模型</td><td>同上，GPU 向量化 unfold+argmax</td></tr>
+      <tr><td>suffix</td><td><code>SuffixDecodingProposer</code> (suffix_decoding.py:9)</td><td>查表无模型</td><td>suffix-tree 匹配 prompt+缓存输出</td></tr>
+      <tr><td>eagle / eagle3</td><td><code>EagleProposer</code> (eagle.py:10)</td><td>模型</td><td>自回归 draft 模型，吃 target hidden；eagle3 拼 aux hidden</td></tr>
+      <tr><td>draft_model</td><td><code>DraftModelProposer</code> (draft_model.py:17)</td><td>模型</td><td>独立 draft LM，不共享 embedding/lm_head</td></tr>
+      <tr><td>medusa</td><td><code>MedusaProposer</code> (medusa.py:18)</td><td>模型(并行头)</td><td>单次 forward 多头 argmax</td></tr>
+      <tr><td>gemma4_mtp / step3p5_mtp</td><td>gemma4.py:31 / step3p5.py:24</td><td>模型</td><td>MTP head，共享 target embedding/lm_head</td></tr>
+      <tr><td>dflash</td><td><code>DFlashProposer</code> (dflash.py:21)</td><td>模型(并行)</td><td>一次出全部 spec token</td></tr>
+      <tr><td>extract_hidden_states</td><td>extract_hidden_states.py:28</td><td>非推测(KV转移)</td><td>存 target hidden 进 KV，返回已采 token 当 draft（恒接受）</td></tr>
+      <tr><td>custom_class</td><td>custom_class_proposer.py:12</td><td>用户定义</td><td>导入 speculative_config.model 指向的类</td></tr>
+    </tbody>
+  </table>
+
+  <div class="diagram-title">verify：一次 forward 验证所有 draft</div>
+  <div class="callout"><code>_prepare_inputs</code> 把 committed+draft gather 进 <code>input_ids</code>（:1948），构建 <code>SpecDecodeMetadata</code>（_calc_spec_decode_metadata :2750，字段：<code>draft_token_ids/num_draft_tokens/cu_num_draft_tokens/target_logits_indices/bonus_logits_indices/logits_indices</code>，metadata.py:9）。<code>_build_attention_metadata</code> 设 <code>max_query_len</code> 覆盖所有 draft 位置（:4273）；forward 后 <code>compute_logits(hidden[logits_indices])</code> 只算 <code>[last_committed, draft_1…K]</code> 这些位置（:4366）。</div>
+
+  <div class="diagram-title">accept/reject：RejectionSampler — rejection_sampler.py:88</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-spec">RejectionSampler.forward(spec_decode_metadata, draft_probs, logits, sampling_metadata)</span> <span class="comment">(rejection_sampler.py:88)</span>
+<span class="comment">  ├─</span> ① 从 bonus_logits_indices 采 bonus token（target 在最后接受 draft 之后会发的）  <span class="comment">:129</span>
+<span class="comment">  ├─</span> ② 取 target_logits[target_logits_indices]，apply processors + 约束            <span class="comment">:148</span>
+<span class="comment">  └─</span> ③ rejection_sample(...) → kernel:                                        <span class="comment">:169</span>
+<span class="comment">        greedy: rejection_greedy_sample_kernel  (:715)</span>
+<span class="comment">        random: rejection_random_sample_kernel  (:773)</span>
+
+<span class="comment">find-first-mismatch (greedy kernel :744-760):</span>
+<span class="comment">  for pos in range(num_draft_tokens):</span>
+<span class="comment">      rejected = (draft_token_id != target_argmax_id)</span>
+<span class="comment">      output[pos] = target_argmax   # 接受则写 target 的 token</span>
+<span class="comment">      if rejected: break           # 第一个不匹配后，后续全留 -1</span>
+<span class="comment">  # 全接受则把 bonus 写到 output[num_accepted]  (:762)</span>
+<span class="comment">  → sampled_token_ids shape [batch, max_spec_len+1]: 接受draft + bonus + (-1 填充)</span></div>
+  </div>
+
+  <div class="diagram-title">update_from_output：接受计数与回滚 — scheduler.py:1464</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="comment">for req_id in scheduled_req_ids:                                  (scheduler.py:1527)</span>
+<span class="comment">    generated_token_ids = sampled_token_ids[req_index]            :1544</span>
+<span class="comment">    scheduled_spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(req_id)  :1548</span>
+<span class="comment">    if scheduled_spec_token_ids and (generated_token_ids or num_sampled==0):</span>
+<span class="comment">        num_draft_tokens = len(scheduled_spec_token_ids)            :1554</span>
+<span class="comment">        num_sampled    = self.num_sampled_tokens_per_step   # LLM=1</span>
+<span class="comment">        num_accepted   = max(len(generated_token_ids) - num_sampled, 0)   :1556</span>
+<span class="comment">                        # generated = 接受draft + bonus；减 1 bonus = 接受的 draft 数</span>
+<span class="comment">        num_rejected   = num_draft_tokens - num_accepted                  :1557</span>
+<span class="comment">        ★ 回滚：被拒的 draft 视为"没算过"</span>
+<span class="comment">        if request.num_computed_tokens &gt; 0:</span>
+<span class="comment">            request.num_computed_tokens -= num_rejected                :1564</span>
+<span class="comment">        if request.num_output_placeholders &gt; 0:</span>
+<span class="comment">            request.num_output_placeholders -= num_rejected            :1568</span>
+<span class="comment">        make_spec_decoding_stats(...)                                   :1569</span>
+<span class="comment">    # grammar 推进 + _update_request_with_output append 接受draft+bonus + check stop</span>
+<span class="comment">    grammar.accept_tokens(req_id, new_token_ids)                       :1603</span>
+<span class="comment">    _update_request_with_output(request, new_token_ids)                :1591</span></div>
+  </div>
+  <div class="callout">被拒的 draft 因 <code>num_computed_tokens</code> 回退，下轮 <code>schedule</code> 会重新计入 <code>num_new_tokens</code> 重算。指标：<code>SpecDecodingStats</code>（metrics.py:17）每步由 <code>make_spec_decoding_stats</code>（scheduler.py:2266）聚合，Prometheus 计数器 <code>vllm:spec_decode_num_*</code>。</div>
+
+  <div class="diagram-title">spec decode 跨步时序</div>
+  <div class="diagram-box mermaid-container">
+    <pre class="mermaid">
+sequenceDiagram
+    participant R as sample_tokens
+    participant S as Scheduler
+    participant E as execute_model
+    participant RS as RejectionSampler
+
+    Note over R: step N-1 末尾 (propose)
+    R->>R: propose_draft_token_ids() draft forward
+    R-->>S: draft_token_ids (post_step)
+    S->>S: update_draft_token_ids → request.spec_token_ids
+
+    Note over S,RS: step N (verify + accept)
+    S->>S: schedule: num_new_tokens = 1+K, scheduled_spec_decode_tokens
+    S-->>E: SchedulerOutput
+    E->>E: input=[last_committed, draft_1…K] forward 一次
+    E-->>R: logits[所有 draft 位置]
+    R->>RS: rejection_sample
+    Note right of RS: find-first-mismatch<br/>+ bonus token
+    RS-->>R: 接受draft + bonus + (-1 填充)
+    R-->>S: ModelRunnerOutput
+    S->>S: num_accepted=len(gen)-1<br/>num_rejected=K-num_accepted<br/>num_computed_tokens -= num_rejected (回滚)
+    S->>S: append 接受draft + bonus
+    Note over R: 若未结束 → step N+1 再 propose
+    </pre>
+  </div>
+  <div class="file-ref">
+    <span class="path-w">v1/worker/gpu_model_runner.py</span><span class="line">:4864</span> propose_draft_token_ids &nbsp;|&nbsp;
+    <span class="path">scheduler.py</span><span class="line">:582-594</span> 切 draft &nbsp;|&nbsp;
+    <span class="path-s">v1/spec_decode/metadata.py</span><span class="line">:9</span> SpecDecodeMetadata &nbsp;|&nbsp;
+    <span class="path-s">v1/sample/rejection_sampler.py</span><span class="line">:88/:715</span> forward/greedy kernel &nbsp;|&nbsp;
+    <span class="path">scheduler.py</span><span class="line">:1556-1564</span> accept/reject 回滚
+  </div>
+</section>
+
+<!-- ═══════ SUMMARY ═══════ -->
+<section class="section" id="summary">
+  <div class="section-label" style="color:var(--text-muted)">附录</div>
+  <div class="section-title">完整时序图与数据对象流转</div>
+
+  <div class="diagram-title">一次完整 step 的端到端时序</div>
+  <div class="diagram-box mermaid-container">
+    <pre class="mermaid">
+sequenceDiagram
+    participant EC as EngineCoreProc
+    participant S as Scheduler
+    participant KV as KVCacheManager
+    participant W as Worker/GPUModelRunner
+    participant GPU as GPU
+
+    Note over EC,GPU: Phase 1: Schedule
+    EC->>S: schedule()
+    S->>KV: new_step_starts()
+    S->>KV: allocate_slots(req)
+    Note right of KV: touch 命中 / get_new_blocks / cache_full_blocks
+    KV-->>S: KVCacheBlocks
+    S-->>EC: SchedulerOutput
+
+    Note over EC,GPU: Phase 2: execute_model (non-blocking)
+    EC->>W: execute_model(sched_out, non_block=True)
+    Note right of W: _update_states / _prepare_inputs / _build_attn_metadata / _preprocess
+    W->>GPU: model forward
+    EC->>S: get_grammar_bitmask() (CPU, 与 forward 并行)
+    Note right of S: grammar_bitmask → numpy
+    W-->>EC: None (logits 暂存 execute_model_state)
+    EC->>EC: future.result()
+
+    Note over EC,GPU: Phase 3: sample_tokens
+    EC->>W: sample_tokens(grammar_output)
+    Note right of W: apply_grammar_bitmask [GPU]<br/>Sampler / RejectionSampler [GPU]<br/>_bookkeeping_sync [唯一 GPU→CPU]<br/>propose_draft_token_ids (spec)
+    W-->>EC: ModelRunnerOutput
+
+    Note over EC,GPU: Phase 4: update_from_output
+    EC->>S: update_from_output()
+    Note right of S: append tokens / check stop<br/>spec accept + 回滚 num_computed_tokens<br/>free KV if done
+    S-->>EC: EngineCoreOutputs
+    EC->>EC: output_queue.put / post_step
+    </pre>
+  </div>
+
+  <div class="diagram-title">关键数据对象流转</div>
+  <div class="diagram-box">
+    <div class="callstack"><span class="fn-engine">Request</span> <span class="comment">(v1/request.py)  num_computed_tokens, spec_token_ids, block_hashes</span>
+<span class="comment">    │</span>
+<span class="comment">    ▼</span>
+<span class="fn-engine">SchedulerOutput</span> <span class="comment">(v1/core/sched/output.py:180)</span>
+<span class="comment">    │  num_scheduled_tokens, scheduled_spec_decode_tokens, req_to_block_ids</span>
+<span class="comment">    │  ═══ model_executor (Future, 跨进程) ═══</span>
+<span class="comment">    ▼</span>
+<span class="fn-worker">GPUModelRunner.execute_model</span> <span class="comment">input_ids, positions, attn_metadata(block_table),</span>
+<span class="comment">    │  SpecDecodeMetadata, ExecuteModelState.logits (GPU)</span>
+<span class="comment">    ▼</span>
+<span class="comment">Hidden States → Logits (GPU)  compute_logits(hidden[logits_indices])</span>
+<span class="comment">    │  (暂存 execute_model_state)</span>
+<span class="comment">    ▼</span>
+<span class="comment">sample_tokens → sampled_token_ids (GPU)  apply_grammar_bitmask → Sampler/RejectionSampler</span>
+<span class="comment">    │  _bookkeeping_sync → CPU list</span>
+<span class="comment">    ▼</span>
+<span class="fn-sampler">ModelRunnerOutput</span> <span class="comment">(v1/outputs.py:233)  sampled_token_ids: list[list[int]], logprobs</span>
+<span class="comment">    │  (含接受的 draft + bonus)</span>
+<span class="comment">    │  ═══ 回 EngineCore ═══</span>
+<span class="comment">    ▼</span>
+<span class="fn-engine">Scheduler.update_from_output</span> <span class="comment">num_accepted/num_rejected, num_computed_tokens 回滚,</span>
+<span class="comment">    │  append_output_token_ids, check_stop</span>
+<span class="comment">    ▼</span>
+<span class="comment">EngineCoreOutput  new_token_ids, finish_reason, scheduler_stats(含 spec stats)</span>
+<span class="comment">    │  ═══ ZMQ PUSH ═══</span>
+<span class="comment">    ▼</span>
+<span class="comment">(前端 OutputProcessor → RequestOutput → SSE/JSON)</span></div>
+  </div>
+
+  <div class="diagram-title">三大设计决策再回顾</div>
+  <table class="data-table">
+    <thead><tr><th>决策</th><th>代码位置</th><th>体现</th></tr></thead>
+    <tbody>
+      <tr><td>execute_model / sample_tokens 拆分</td><td><code>gpu_model_runner.py:4417</code> return None；<code>:4435</code> sample_tokens；<code>core.py:491-499</code></td><td>grammar bitmask 藏在 GPU forward 后面</td></tr>
+      <tr><td>采样全程 GPU，单一同步</td><td><code>sampler.py</code> 全 GPU op；<code>gpu_model_runner.py:3613/:7504</code></td><td>回避 multinomial，用 Gumbel-max/FlashInfer</td></tr>
+      <tr><td>spec decode 复用 token 记账</td><td><code>scheduler.py:390-399</code>；<code>:463-467</code>；<code>:582-594</code>；<code>:1564</code></td><td>chunked prefill/prefix cache/spec 同一套逻辑</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<!-- ═══════ READING ORDER ═══════ -->
+<section class="section" id="reading">
+  <div class="section-label" style="color:var(--text-muted)">How to read it</div>
+  <div class="section-title">代码阅读顺序</div>
+
+  <ol class="read-list">
+    <li><strong>busy loop 主干</strong>：<code>core.py:1259 run_busy_loop</code> → <code>:1269 _process_input_queue</code> → <code>:1300 _process_engine_step</code> → <code>:479 step</code>。建立三线程模型。</li>
+    <li><strong>socket 解耦</strong>：<code>core.py:1484 process_input_sockets</code>、<code>:1589 process_output_sockets</code>，理解 ABORT 为何入两个队列。</li>
+    <li><strong>schedule 主干</strong>：<code>scheduler.py:388</code>，先读 :390-399 记账注释，再读 RUNNING（:430-623）和 WAITING（:625-988）循环。</li>
+    <li><strong>KV cache 三层</strong>：<code>kv_cache_manager.py:244 allocate_slots</code>（十步）→ <code>single_type_kv_cache_manager.py:101</code>（block 数）→ <code>block_pool.py:542/597/614</code>（LRU/淘汰）→ <code>kv_cache_utils.py:577/673</code>（prefix hash）。</li>
+    <li><strong>抢占</strong>：<code>scheduler.py:523-572</code> 抢占循环 → <code>:1107 _preempt_request</code>（recompute 无 swap）→ <code>:2082 _free_request_blocks</code>（延迟 free）。</li>
+    <li><strong>executor dispatch</strong>：<code>abstract.py:221</code> → <code>uniproc_executor.py:79</code> → <code>gpu_worker.py:835</code> → <code>gpu_model_runner.py:4056</code>。对比 <code>multiproc_executor.py:340/:979</code> 看跨进程。</li>
+    <li><strong>execute_model 内部</strong>：<code>:1127 _update_states</code> → <code>:1889 _prepare_inputs</code>（spec metadata :2161/:2750）→ <code>:2216 _build_attention_metadata</code> → <code>:3439 _preprocess</code> → <code>:3822 cuda graph 决策</code> → <code>:4332 _model_forward</code> → <code>:4398</code> 暂存 state。</li>
+    <li><strong>sampling</strong>：<code>:4435 sample_tokens</code> → <code>structured_output/utils.py:85</code> → <code>sampler.py:72/371/243</code> → <code>topk_topp_sampler.py:70</code>（Gumbel-max/FlashInfer）→ <code>:3613/:7504 _bookkeeping_sync/_to_list</code>。</li>
+    <li><strong>spec decode</strong>：<code>gpu_model_runner.py:4864 propose_draft_token_ids</code> → <code>llm_base_proposer.py:443</code> → <code>scheduler.py:1900 update_draft_token_ids</code> → schedule <code>:582-594</code> 切 draft → verify forward → <code>rejection_sampler.py:88/394/715</code> → <code>scheduler.py:1464/1556-1564</code> 接受与回滚。</li>
+    <li><strong>指标</strong>：<code>scheduler.py:2266 make_spec_decoding_stats</code> → <code>v1/spec_decode/metrics.py:17</code>。</li>
+  </ol>
+
+  <div class="callout"><strong>一条记忆线索</strong>：所有"特殊"机制（chunked prefill、prefix cache、spec decode、jump decoding）都不是独立分支，而是被 <code>num_tokens_with_spec</code> / <code>num_computed_tokens</code> 这套统一记账吸收进同一个 <code>schedule → allocate_slots → execute_model → sample → update_from_output</code> 循环。抓住这条主线和三个设计决策，其余都是分支。</div>
+
+  <div class="file-ref" style="margin-top:32px">
+    核对基准：vLLM tag <span class="path">v0.24.0</span> (commit ee0da84ab) &nbsp;|&nbsp; 配套 markdown：<span class="path">learning_doc/execution-core.md</span> &nbsp;|&nbsp; 风格参考：<span class="path">vllm-request-journey.html</span>
+  </div>
+</section>
+
+</div><!-- end .main -->
+
+<script>
+mermaid.initialize({
+  startOnLoad: true,
+  theme: 'dark',
+  themeVariables: {
+    fontFamily: '"Inter", sans-serif',
+    fontSize: '13px',
+    primaryColor: '#1c2128',
+    primaryTextColor: '#e6edf3',
+    primaryBorderColor: '#30363d',
+    lineColor: '#484f58',
+    secondaryColor: '#161b22',
+    tertiaryColor: '#21262d',
+    actorTextColor: '#e6edf3',
+    actorBkg: '#1c2128',
+    actorBorder: '#30363d',
+    actorLineColor: '#30363d',
+    signalColor: '#e6edf3',
+    signalTextColor: '#8b949e',
+    labelBoxBkgColor: '#161b22',
+    labelBoxBorderColor: '#30363d',
+    labelTextColor: '#e6edf3',
+    loopTextColor: '#e6edf3',
+    noteBkgColor: '#1c2128',
+    noteTextColor: '#e6edf3',
+    noteBorderColor: '#30363d',
+    activationBorderColor: '#1f6feb',
+    activationBkgColor: '#1f6feb22',
+    sequenceNumberColor: '#e6edf3',
+  },
+  sequence: { actorMargin: 60, messageMargin: 30, mirrorActors: false, useMaxWidth: false, wrap: true, wrapPadding: 10 },
+  flowchart: { htmlLabels: true, curve: 'basis', useMaxWidth: true }
+});
+
+const sections = document.querySelectorAll('.section, .hero');
+const navLinks = document.querySelectorAll('.nav a');
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(entry => {
+    if (entry.isIntersecting) {
+      const id = entry.target.id;
+      navLinks.forEach(link => {
+        link.classList.toggle('active', link.getAttribute('href') === '#' + id);
+      });
+    }
+  });
+}, { rootMargin: '-20% 0px -60% 0px' });
+sections.forEach(section => { if (section.id) observer.observe(section); });
+navLinks.forEach(link => {
+  link.addEventListener('click', () => {
+    document.querySelector('.nav').classList.remove('open');
+  });
+});
+</script>
+</body>
+</html>
