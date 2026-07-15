@@ -1,27 +1,70 @@
-# vLLM V1 执行内核深入：从 busy loop 到 spec decode
+# vLLM V1 执行内核：一轮 step 如何产出下一个 token
 
 > 本文是 [`request.md`](./request.md) 的深入篇。`request.md` 画的是一个 request 从 HTTP 到返回的全旅程；
 > 本文则放大 `EngineCore.step()` 内部的四段——**run busy loop → schedule（含 KV cache 规划与分配）→
 > model executor / 模型运行 → sampling → spec decode**——把调度、KV cache、forward、采样、推测解码
 > 的调用栈、数据对象和算法细节讲透。
 >
-> 核对基准：`vllm` 仓库 tag **`v0.24.0`**（commit `ee0da84ab`）。所有 `file:line` 都基于该版本核对，
-> 可直接点开。默认路径 `VLLM_USE_V2_MODEL_RUNNER=0`（走 `vllm/v1/worker/gpu_model_runner.py`）。
+> 核对基准：`vllm` 仓库 tag **`v0.25.1`**（commit `752a3a504`）。`file:line` 基于该版本核对，可直接点开
+> （3.3.14 例外——它标注了基于 `glm5_next` 本地工作树，因为其中的 mamba 均衡分组 + 多层组内存核算是
+> 尚未进入 v0.25.1 的本地改动）。默认路径 `VLLM_USE_V2_MODEL_RUNNER=0`
+> （走 `vllm/v1/worker/gpu_model_runner.py`）。
+
+## 0. 先跑通一次普通 decode（建议 5 分钟）
+
+这不是一篇按文件目录展开的源码索引，而是一条**从一个请求到下一个 token**的因果链。先把下面的
+“无 spec、无多模态、单个正在 decode 的请求”跑通；KV cache、grammar、异步和 spec decode 都只是
+在这条链上的局部变化。
+
+```text
+① Request 在 waiting / running 队列中
+        │
+② schedule() 决定：本轮算哪个请求、算几个 token、占哪些 KV block
+        │                         └── SchedulerOutput
+③ execute_model() 依 SchedulerOutput 准备 GPU 输入并做 forward
+        │                         └── logits 暂留 GPU
+④ sample_tokens() 在 GPU 上把 logits 变成 token
+        │                         └── ModelRunnerOutput
+⑤ update_from_output() 把 token 提交给 Request，释放已结束请求的资源
+        └── 未结束就回到 ②；下一轮 decode 通常再算 1 个 token
+```
+
+### 用四个问题读完整篇
+
+| 问题 | 先看哪一章 | 得到什么答案 |
+|---|---|---|
+| 引擎什么时候阻塞、什么时候连续跑 step？ | 第 1、2 节 | 输入线程、主线程、输出线程如何协作 |
+| 为什么这个请求能在这一轮运行？ | 第 3 节 | token 预算、RUNNING 优先、KV 准入与抢占 |
+| GPU 到底执行了什么，CPU 等在哪里？ | 第 4、5 节 | `SchedulerOutput → logits → ModelRunnerOutput`，及唯一同步点 |
+| draft token 为什么能复用普通 decode 的路径？ | 第 6 节 | 多调度、一次验证、接受或回滚 |
+
+### 四个不变量
+
+| 字段 | 可以把它理解为 | 阅读时观察它何时变化 |
+|---|---|---|
+| `num_computed_tokens` | 已被 GPU 计算、可作为 KV 上下文的位置 | 提交输出时增加；draft 被拒时回退 |
+| `num_tokens_with_spec` | prompt + 已输出 + 待验证 draft 的总长度 | scheduler 计算工作量的基准 |
+| `num_new_tokens` | **这一步实际送入模型的 token 数** | 受 token budget / prefill 阈值裁剪 |
+| `num_output_placeholders` | 异步路径预留的输出位置 | 保持 CPU 计账与 GPU 执行一致 |
+
+> **第一次阅读的捷径**：第 1 → 2 → 3（只读主流程）→ 4 → 5 → 6。第 3 节里的“KV cache
+> 类型、MLA、Mamba、Hybrid”和第 4 节里的多模态都是进阶分支，先跳过不会影响主线理解。
 
 ## 目录
 
-1. [全局视角与本文定位](#1-全局视角与本文定位)
-2. [run_busy_loop：EngineCore 的主驱动循环](#2-run_busy_loopenginecore-的主驱动循环)
-3. [Phase 1：schedule — 调度与 KV cache 规划分配](#3-phase-1schedule--调度与-kv-cache-规划分配)
-4. [Phase 2：model executor → 模型运行](#4-phase-2model-executor--模型运行)
-5. [Phase 3：sampling — 从 logits 到 token](#5-phase-3sampling--从-logits-到-token)
-6. [Phase 4 → spec decode：从 sampling 到 draft 验证](#6-phase-4--spec-decode从-sampling-到-draft-验证)
-7. [完整时序图与数据对象流转](#7-完整时序图与数据对象流转)
-8. [代码阅读顺序](#8-代码阅读顺序)
+0. [先跑通一次普通 decode](#0-先跑通一次普通-decode建议-5-分钟)
+1. [谁在驱动闭环：全局视角](#1-谁在驱动闭环全局视角)
+2. [控制循环：run_busy_loop 与 step](#2-控制循环run_busy_loop-与-step)
+3. [决定本轮工作：schedule 与 KV cache](#3-决定本轮工作schedule-与-kv-cache)
+4. [执行本轮工作：model executor 与 GPU](#4-执行本轮工作model-executor-与-gpu)
+5. [把 logits 变成 token：sampling](#5-把-logits-变成-tokensampling)
+6. [同一闭环的变体：spec decode](#6-同一闭环的变体spec-decode)
+7. [回查：完整时序与数据对象流转](#7-回查完整时序与数据对象流转)
+8. [回查：代码阅读顺序](#8-回查代码阅读顺序)
 
 ---
 
-## 1. 全局视角与本文定位
+## 1. 谁在驱动闭环：全局视角
 
 `request.md` 已经给出 step() 的四阶段总览。本文不再重复 HTTP/API 层，而是从
 `EngineCoreProc.run_busy_loop()` 进入，沿着下面这条主干一路下到 GPU 和 spec decode：
@@ -63,7 +106,7 @@ EngineCoreProc.run_busy_loop()            v1/engine/core.py:1259
 
 ---
 
-## 2. run_busy_loop：EngineCore 的主驱动循环
+## 2. 控制循环：run_busy_loop 与 step
 
 ### 2.1 进程 / 线程模型
 
@@ -260,11 +303,14 @@ worker 产出的 draft token 拉回 scheduler（`take_draft_token_ids()` → `up
 
 ---
 
-## 3. Phase 1：schedule — 调度与 KV cache 规划分配
+## 3. 决定本轮工作：schedule 与 KV cache
 
 `Scheduler.schedule()`（`v1/core/sched/scheduler.py:388`）是每个 iteration 的起点。它不区分
 “prefill phase / decode phase”，而是用一个统一的 token 记账把 chunked prefill、prefix cache、
 spec decode 全部纳入。
+
+> **本章主线**：先读 3.1、3.2 和 3.5，回答“谁先跑、这一轮算多少 token、输出给 Worker 什么”。
+> 3.3.1–3.3.5 是所有模型共用的 KV 分配机制；从 3.3.6 起是缓存格式和混合模型的进阶参考，可按需读。
 
 ### 3.1 Scheduler 持有的状态
 
@@ -583,7 +629,7 @@ _preempt_request(request, scheduled_timestamp)
 把 block 摘下、暂存 `deferred_frees`，等 `update_from_output` 里 `processed_step_seq` 追上后由
 `_drain_deferred_frees`（`scheduler.py:2097`）真正还回 pool——避免释放还在被 GPU 写的 block。
 
-#### 3.3.6 KV cache 的种类全景：Spec → Manager
+#### 3.3.6 进阶：KV cache 的种类全景：Spec → Manager
 
 前面讲的 `allocate_slots` / prefix cache / 抢占都是**机制**，跟"缓存里到底存什么"无关。vLLM 用
 **`KVCacheSpec`（每层一份）**描述"这一层缓存什么、一个 block 多大"，用 **`SingleTypeKVCacheManager`**
@@ -909,6 +955,294 @@ Beat6    #0[≈∗]  #1[≈∗]  #2[≈∗]  #3·     #4·     ···  KV 满 �
 `KVCacheCoordinator`（跨组策略）→ `SingleTypeKVCacheManager`/`FullAttentionManager`（组内 per-request
 记账 + 命中/分配）→ `BlockPool`（物理 block 的 LRU + 哈希）。六者各管一层，靠委托链串起来。
 
+#### 3.3.14 加载期规划：从 KVCacheSpec 到 group 与 num_blocks
+
+3.3.1–3.3.13 讲的是**运行时**怎么分配/命中/释放 block。但有两个上游问题一直没回答：① 这些 group 是
+怎么从每层的 `KVCacheSpec` 分出来的？② 池子里到底有多少个 block（`num_blocks`）是怎么从可用显存算
+出来的？这一节补这个洞——它发生在**引擎初始化时一次**，产出的 `KVCacheConfig`（groups + num_blocks）
+是后面所有运行时记账的基准。
+
+> **版本说明**：本节 `file:line` 基于 `glm5_next` 工作树（含本地 commit `08f98cd5c` "refine kv cache
+> group"），与全文的 v0.25.1 基准不同。**分组决策树、num_blocks、max_concurrency 这套机制跨版本稳定**；
+> 带 ★ 的是本地改动（mamba 均衡分组 + 多层组内存核算）。
+
+**数据流总览（单页）** —— 从每层 spec 一路到 num_blocks 与 max_concurrency：
+
+```
+┌─ 输入（加载期，每模型一次）─────────────────────────────────────────────────────┐
+│  kv_cache_spec   : dict[layer_name → KVCacheSpec]   每层一份（spec 层级见 3.3.6）│
+│  available_memory: int                             profiling 出的 KV 可用显存     │
+└─────────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+   get_kv_cache_groups(vllm_config, kv_cache_spec)              kv_cache_utils.py:1809
+      分组决策树（早返回级联，从特殊→一般，详见 (1)）：
+        uniform_spec  → uniform_type  → grouped(DSv4)  → 通用混合 ★
+                                                       (抽 mamba → attention 凑等大
+                                                        → mamba 按位置均衡分桶加回)
+                                      │
+                                      ▼
+                     list[KVCacheGroupSpec]            每 group = (layer_names, kv_cache_spec)
+                                      │
+                                      ▼
+   get_kv_cache_config_from_groups(groups, available_memory)     kv_cache_utils.py:1340
+      total_page = Σ _group_bytes_per_block(g)                    :1395   ← (4) 每 group 字节核算
+                     ├─ UniformType : page_size          (已含多层)
+                     └─ 普通        : page_size × len(layer_names)   ★
+      num_blocks  = available_memory // total_page
+                   → may_override_num_blocks  (应用 --num-blocks 覆盖 / watermark)
+                                      │
+                                      ▼
+                KVCacheConfig(num_blocks, kv_cache_groups, kv_cache_tensors)
+                                      │
+          ┌───────────────────────────┼───────────────────────────┐
+          ▼                           ▼                           ▼
+   ┌─ 运行时消费者 ──────────┐  get_max_concurrency_for_kv_cache_config   其它
+   │ Scheduler.__init__ →    │     kv_cache_utils.py:920                   │
+   │   KVCacheManager +      │   max_mem/req = Σ max_memory × len(layers)   │ - /metrics 上报
+   │   BlockPool(num_blocks) │       (_max_memory_usage_bytes_from_groups  │   KV token 容量
+   │ gpu_model_runner →      │        :1950)   ★                          │
+   │   按 group 分配每层 KV  │   mem/block   = _pool_bytes_per_block(...)  │
+   │   tensor（block_table   │       (4 分支：单UniformType/packed/混合★/通用)│
+   │   跨层共享 num_blocks   │   max_concurrency = num_blocks              │
+   │   个 id）               │       / cdiv(max_mem/req, mem/block)        │
+   │ NiXL PD 握手 →          └────────────────────────────────────────────┘
+   │   D 侧按 group/page
+   │   核算对齐 block_len
+   │   （这里算错 PD region
+   │    跟着错）
+   └─────────────────────────┘
+```
+
+一句话：**spec → `get_kv_cache_groups` 分组 → `Σ _group_bytes_per_block` 算 total_page →
+`available // total_page` 得 num_blocks → `num_blocks / (max_mem÷mem_per_block)` 得 max_concurrency**。
+其中 `_group_bytes_per_block` 的 `× len(layer_names)`（★）是多层组不漏算内存的关键。
+
+**(1) 分组决策树** —— `get_kv_cache_groups`（`kv_cache_utils.py:1809`）
+
+输入 `{layer_name: KVCacheSpec}`（每层一份），输出 `list[KVCacheGroupSpec]`。是一条**早返回级联**，
+从最特殊到最一般：
+
+```
+get_kv_cache_groups(vllm_config, kv_cache_spec)                 kv_cache_utils.py:1809
+  ├─ disable_hybrid_kv_cache_manager? → unify_hybrid_kv_cache_specs   强制把所有 spec 同化成一种
+  ├─ attention-free 模型?        → return []                          :1825
+  ├─ 所有层 spec 完全相同?        → _get_kv_cache_groups_uniform_spec  (1 个大 group)   :1830  def :1012
+  ├─ 所有层"等价类型"(等 token 槽数)? → UniformTypeKVCacheSpecs.from_specs
+  │      └─ _get_kv_cache_groups_uniform_type  (1 个 group)            :1835  def :1029
+  │      例：全是 full-attn，或全是等窗 SWA
+  ├─ 可分组+统一 (DeepseekV4)?   → group_and_unify_kv_cache_specs
+  │      └─ _get_kv_cache_groups_uniform_groups (多个 UniformType group) :1840  def :1684
+  │      例：等槽数但类型/尺寸不同（full + 多种 SWA）
+  └─ 【通用混合路径】★                                                 :1848+
+         抽出 HiddenStateCacheSpec / MambaSpec → 剩余 attention 凑等大 page
+         → 把抽出的 mamba 按位置均衡加回（见 (2)）
+```
+
+| 场景 | 命中分支 | 典型模型 |
+|------|----------|----------|
+| 纯 full-attn | uniform_spec | Llama / Qwen 等绝大多数 |
+| MLA + indexer（等槽） | uniform_type | DeepSeek-V3.2 sparse MLA |
+| full + 多种 SWA（等槽） | grouped（DSv4） | DeepSeek-V4 |
+| full/MLA + Mamba/线性（不等槽） | 通用混合 ★ | Jamba / Nemotron-H / KimiLinear / **GLM-5Next** |
+
+**(2) 通用混合路径：抽出 + 凑等大 + 均衡加回** ★（本地改动）
+
+hybrid 模型（attention + Mamba/线性）走的路，`get_kv_cache_groups` 末尾（`:1848`）：
+
+```
+① 抽出 hidden_specs (HiddenStateCacheSpec) 和 mamba_specs (MambaSpec)
+   → filtered_spec 只剩 attention 层
+② filtered_spec 再走 uniform_type / uniform_page_size 分组（attention 层之间凑等大 page）
+③ hidden 层按 common_page 对齐后逐层成组
+④ ★ mamba 层不再"每层一组"，而是按"在每段连续 mamba run 中的位置"分桶成少数几个均衡组   :1898-1909
+```
+
+④ 的分桶：遍历层序，遇到非 mamba（attention）就把 `run_pos` 归零；mamba 层按 `run_pos` 进对应桶。
+注释例子 `(M,M,M,A)×11 + M` → 3 个组，分别 12/11/11 层。
+
+**为什么均衡而不是每层一组**：原来每个 mamba 层各自一组（N 组 = N 个 block table + N 份 per-group
+记账）；均衡后 ~3 个组，**组数/block-table 数大幅减少**，池子更紧凑。注意 mamba 是 O(1)/request 的固定
+state（见 3.3.10），**无论怎么分组，总字节数不变**——均衡只改"怎么打包"，不改"占多少"。
+
+**(3) num_blocks 核算** —— `get_kv_cache_config_from_groups`（`:1340`）
+
+```
+total_page_size = Σ _group_bytes_per_block(group)            :1395   一个 block 跨所有 group 的总字节
+num_blocks      = available_memory // total_page_size
+                 （再经 may_override_num_blocks 应用 --num-blocks 覆盖 / watermark）
+```
+
+每层一个物理 tensor，`num_blocks` 是它们**共享的块数**（同一物理 block id 被所有层复用，见 3.3.7）。
+`available_memory` 是 profiling 出的 KV 可用显存。
+
+**(4) 每 group 字节核算** —— `_group_bytes_per_block`（`:947`）+ `_pool_bytes_per_block`（`:954`）
+
+`_group_bytes_per_block`（`:947`）—— **多层组的关键**：
+
+```python
+if isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs):
+    return group.kv_cache_spec.page_size_bytes          # UniformType 已含多层，直接用
+return group.kv_cache_spec.page_size_bytes * len(group.layer_names)  # ★ 普通 spec：× 层数
+```
+
+`_pool_bytes_per_block`（`:954`）四个分支，对应不同分配策略：
+
+| 分支 | 条件 | 公式 |
+|------|------|------|
+| 单 UniformType 组 | 1 group 且是 UniformType | `spec.page_size_bytes` |
+| packed 分配 | `_use_packed_kv_cache_config` | `Σ page_size × 该桶层数` |
+| 混合（UniformType + 其它）★ | 有 UniformType 又有 Mamba 等 | `Σ _group_bytes_per_block(g)` |
+| 通用 | 其余（纯 full+SWA 等） | `uniform_page_size × max(group_size)` |
+
+> **★ 这个 `× len(layer_names)` 是本 commit 修的 bug**：`page_size_bytes` 是**单层**的，多层组（如均衡
+> 后的 12 层 mamba 组）必须乘层数，否则 `_pool_bytes_per_block` / `_max_memory_usage` 会**少算** →
+> `num_blocks` 偏大、`max_concurrency` 偏高 → 实际跑起来**超出显存 / OOM**。原来 mamba 每层一组（×1）
+> 所以"碰巧"对；一旦改成均衡多层组就必须乘。**两者是耦合的改动**——分组（②）创造多层组，核算（④）才
+> 需要乘层数；缺一不可。
+
+**(5) 最大并发** —— `get_max_concurrency_for_kv_cache_config`（`:920`）
+
+```
+max_memory_per_request = _max_memory_usage_bytes_from_groups(...)   :1950   单请求最大 KV 占用
+memory_per_block       = _pool_bytes_per_block(...)                          每 block 字节
+num_block_per_request  = cdiv(max_memory_per_request, memory_per_block)
+max_concurrency        = num_blocks / num_block_per_request
+```
+
+`_max_memory_usage_bytes_from_groups`（`:1950`）同样要 `× len(layer_names)`（`:2011`）：每个物理层都有
+状态，单组多层要按层累加。旧版用 `max(group_size) × 单一 per-group 内存` 的近似，对异构 hybrid 不准——
+本 commit 改成逐组精确累加。
+
+**(6) 实例：GLM-5Next**（commit 的测试 `test_get_kv_cache_config_balanced_mamba_hybrid`）
+
+45 层：每 4 层一段，第 4 层是 `MLA + indexer`（11 段 attention = 22 个层名），其余 34 层是 mamba/KDA。
+`get_kv_cache_groups` 产出 **4 个 group**：
+
+```
+group 0 : UniformTypeKVCacheSpecs (MLA + indexer)   22 层名 / 11 物理层
+group 1 : MambaSpec               12 层     ┐
+group 2 : MambaSpec               11 层     ├ 均衡三组 (12+11+11 = 34)
+group 3 : MambaSpec               11 层     ┘
+```
+
+测试断言（验证内存不漏算）：
+
+- `max_memory == Σ 每层 max_memory_usage_bytes`（逐层不漏）
+- `bytes_per_block == Σ 每层 page_size_bytes`（池核算不漏）
+- `num_blocks == available // bytes_per_block == 100`
+- 45 个 tensor：11 个 `shared_by==2`（MLA/indexer 共享一块）+ 34 个 `shared_by==1`（mamba）
+- `max_concurrency == 100 / blocks_per_request`
+
+**要点速记**
+
+- **加载期 vs 运行时**：group 分法 + num_blocks 是**一次**定的（本节）；allocate_slots/命中/抢占是**每步**
+  的（3.3.1–3.3.5）。后者以前者为基准。
+- **多层组必须 `× len(layer_names)`**，否则少算内存 → OOM。`UniformTypeKVCacheSpecs` 已含多层，别重复乘。
+- **mamba 均衡分组改的是打包方式**（组数↓、block-table↓），不改总字节数。
+- **和 PD disagg 的衔接**：NiXL 握手时 D 侧按这里的 group/page 核算来对齐 `block_len`；这里算错，PD 的
+  region 大小也跟着错。
+- **上游查重**：已有 open PR（#40384 排除 O(1) mamba 组 / #41124 mamba `block_size=None`）在修同一片
+  区域，独立提交前需先对齐。
+
+#### 3.3.15 DSv4 Packed KV cache：多层共享一个物理 tensor
+
+3.3.7 说"每层一个 KV tensor"。DSv4 打破了这个默认——它把所有层（同 page size）的 per-block KV 数据
+**打包进同一个物理 tensor**，每层只是这块内存的一个 strided view（按 `storage_offset` 切出自己的区域）。
+这是 DeepSeek-V4 的标志性内存布局优化。本节基于 v0.25.1。
+
+**(1) 为什么 packed**
+
+DSv4 全是 `UniformTypeKVCacheSpecs`（等 token 槽数、同 page size），层数多。默认"每层一个 tensor"会得到
+N 个独立分配 + N 个碎片化区域；packed 则**一个物理 tensor，所有层 view 共享、per-block 数据连续**——内存
+局部性好、分配开销低、下游（如 NiXL）只需注册一个 region。
+
+**(2) 何时启用** —— `_use_packed_kv_cache_config`（`kv_cache_utils.py:1255`）
+
+```
+is_dsv4 = 所有 group 都是 UniformTypeKVCacheSpecs
+return is_dsv4 or (enable_cross_layers_blocks=True and 多 group)   # 后者是实验 API（issue #42082）
+```
+
+即：DSv4 默认走 packed；其它多 group 模型可用 `enable_cross_layers_blocks` 显式 opt in。
+
+**(3) 规划 packed 布局** —— `_get_kv_cache_config_packed`（`kv_cache_utils.py:1277`，别名
+`_get_kv_cache_config_deepseek_v4`）
+
+```
+① _bucket_layers_by_page_size(groups)            :1230
+     buckets = {page_size: [[layer@slot0], [layer@slot1], ...]}
+     规则：同一 (page_size, slot_idx) 的不同 group 的层共享一个 tensor
+           （它们各有独立 block_table，block-id 命名空间不冲突）
+② total_num_bytes_per_block = Σ page_size × len(slots)        一个 block 跨所有 slot 的总字节
+③ num_blocks = available_memory // total_num_bytes_per_block
+④ ONE 物理分配 total_size = total_num_bytes_per_block × num_blocks
+⑤ 每个 KVCacheTensor(
+        size=total_size,
+        shared_by=slot,                         # 该 slot 上的所有层
+        offset=byte_offset,                     # ★ 块内字节偏移，逐 slot 累加 ps
+        block_stride=total_num_bytes_per_block) # ★ packed 时每 block 总字节
+   byte_offset += ps    # 逐 slot
+```
+
+**(4) `KVCacheTensor` 的两个新字段**（`kv_cache_interface.py:893`）
+
+| 字段 | 含义 |
+|------|------|
+| `offset` | 该层在**一个连续 block 内**的字节偏移（packed 才用） |
+| `block_stride` | packed 布局下**每 block 总字节**；`0` = 非 packed（每层独占 tensor） |
+
+**(5) runner 侧物化** —— `_allocate_kv_cache_raw_tensors`（`gpu_model_runner.py:7095`）+
+`_reshape_kv_cache_tensors`（`:7133`）
+
+```
+分配：if block_stride > 0:
+          packed_backing = torch.zeros(total_size, int8)   # 只 new 一次
+          所有 packed KVCacheTensor 的 raw_tensor = packed_backing   # alias 同一块内存
+      else: 每层独立 torch.zeros(...)
+reshape：layer_packing[layer] = (offset, block_stride)        :7154
+         _reshape_attention_kv_cache(raw, shape, ..., packing)
+           └─ torch.as_strided(raw.view(dtype), shape, stride,
+                               storage_offset = offset // dtype_size)  # ★ 每层按 offset 切 view
+```
+
+所以"共享一个 tensor"= 多层是**同一块 int8 内存的 strided view**，靠 `storage_offset` 区分各自的数据。
+
+**(6) 内存布局对比**
+
+```
+默认（per-layer，非 packed）：每层一个独立 tensor
+  layer0: [blk0][blk1][blk2]...   ← tensor A  ┐
+  layer1: [blk0][blk1][blk2]...   ← tensor B  ├ 各自独立分配
+  layer2: [blk0][blk1][blk2]...   ← tensor C  ┘
+
+DSv4 packed：所有层 view 进同一个物理 tensor（block_stride = Σ ps）
+  packed_backing (int8, total_size):
+  byte   0      ps0    ps0+ps1              block_stride
+        ├ slot0 ┤ slot1 ┤ slot2 ┤ ... ┤
+  blk0  [layer0 ][layer1 ][layer2 ] ... [ ]     ← storage_offset: 0 / ps0 / ps0+ps1
+  blk1  [layer0 ][layer1 ][layer2 ] ... [ ]     ← +1×block_stride
+  blk2  [layer0 ][layer1 ][layer2 ] ... [ ]     ← +2×block_stride
+
+  layer_i = as_strided(packed_backing, shape, stride,
+                       storage_offset = offset_i)   # 同一块内存的不同视图
+```
+
+block 寻址：layer L（在 slot s、offset o_s、page_size ps_s）的 block b 起始字节 =
+`b × block_stride + o_s`，长度 `ps_s`。
+
+**要点速记**
+
+- **packed 只改物理分配**（一个 tensor vs N 个），**不改 block_table 语义**——每 group/层仍各有自己的
+  block_table，只是它们最终都索引进同一个物理 backing 的不同 offset。
+- **NiXL 受益**：`register_kv_caches` 有 packed fast-path，所有层 strided view 同一 storage 时只注册**一个**
+  NIXL region（而不是 N 个），减少描述符开销。
+- **packed ≠ co-location**：packed 是 DSv4（全 UniformType）的"全层共享一个 backing"；GLM-5Next 的
+  MLA+indexer 那种"成对共享"（`shared_by=[idx, mla]`，3.3.14 提到）是 co-location，走的是 glm5_next 本地的
+  mixed 分支，**不是** packed——GLM-5Next 含 MambaSpec，不满足 `_use_packed_kv_cache_config` 的 is_dsv4。
+- **不漏算内存**：packed 下 `total_num_bytes_per_block` 已把所有 slot 的 ps 求和，`num_blocks` 据此算，
+  不会像多层组那样需要额外 `× len`（见 3.3.14 的对比）。
+
 ### 3.4 KV cache 规划与分配流程图
 
 ```
@@ -988,7 +1322,10 @@ Beat6    #0[≈∗]  #1[≈∗]  #2[≈∗]  #3·     #4·     ···  KV 满 �
 
 ---
 
-## 4. Phase 2：model executor → 模型运行
+## 4. 执行本轮工作：model executor 与 GPU
+
+> **本章主线**：把 `SchedulerOutput` 当作 Worker 的“执行说明书”。先读 4.1 → 4.5：它如何跨进程
+> 下发、如何构造输入、何时走 CUDA Graph、为什么 logits 暂存在 GPU。4.6 多模态是同一输入准备流程的扩展。
 
 ### 4.1 EngineCore → model_executor：非阻塞 dispatch
 
@@ -1286,7 +1623,10 @@ image-pad）。`_merge_multimodal_embeddings`（`models/utils.py:500`）把这�
 
 ---
 
-## 5. Phase 3：sampling — 从 logits 到 token
+## 5. 把 logits 变成 token：sampling
+
+> **本章主线**：`execute_model()` 的职责到 logits 为止；本章负责约束、采样和把结果交回 CPU scheduler。
+> 先记住一条性能边界：除 `_bookkeeping_sync()` 外，正常采样路径都尽量不让 GPU 等 CPU。
 
 ### 5.1 sample_tokens 全流程
 
@@ -1470,11 +1810,15 @@ GPU op、返回 GPU tensor。sampled id 必须变 Python int 才能（a）更新
 
 ---
 
-## 6. Phase 4 → spec decode：从 sampling 到 draft 验证
+## 6. 同一闭环的变体：spec decode
 
 spec decode 是 propose → verify → accept/reject 的跨步循环，**复用前文所有机制**：
 draft token 计入 `num_tokens_with_spec`、走 `allocate_slots` 分配、走一次 `execute_model` 验证、
 走 `RejectionSampler` 判定、走 `update_from_output` 回滚。
+
+> **读法**：不要把 spec decode 当成第二条执行管线。它只改变两件事：`schedule()` 一次多放入
+> `K` 个候选 token；`update_from_output()` 根据接受数回退没被接受的位置。其余节点仍是普通 decode
+> 的 `schedule → forward → sample → update`。
 
 ### 6.1 总体架构
 
@@ -1695,7 +2039,7 @@ post_step()                            │
 
 ---
 
-## 7. 完整时序图与数据对象流转
+## 7. 回查：完整时序与数据对象流转
 
 ### 7.1 一次完整 step 的端到端时序
 
@@ -1792,7 +2136,7 @@ EngineCoreOutput                         new_token_ids, finish_reason, scheduler
 
 ---
 
-## 8. 代码阅读顺序
+## 8. 回查：代码阅读顺序
 
 建议按“主干 → 分支”读，每步都先建立数据对象，再追调用栈：
 

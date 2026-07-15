@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>vLLM V1 执行内核：busy loop → spec decode</title>
+<title>vLLM V1 执行内核：一轮 step 如何产出 token</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
@@ -83,6 +83,55 @@ body {
 .section:last-child { border-bottom: none; }
 .section-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 2px; margin-bottom: 8px; }
 .section-title { font-size: 32px; font-weight: 700; margin-bottom: 32px; line-height: 1.2; }
+
+/* ─── Reader orientation ─── */
+.reader-map { padding-top: 46px; padding-bottom: 48px; }
+.reader-map .section-title { margin-bottom: 14px; }
+.map-intro { max-width: 760px; font-size: 15px; color: var(--text-secondary); line-height: 1.75; }
+.phase-ribbon { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin: 28px 0 18px; }
+.phase-card {
+  position: relative; display: block; min-height: 172px; padding: 17px; border: 1px solid var(--border);
+  border-radius: 12px; background: linear-gradient(145deg, rgba(255,255,255,.045), rgba(255,255,255,.012));
+  color: var(--text-primary); text-decoration: none; transition: transform .18s ease, border-color .18s ease, background .18s ease;
+}
+.phase-card:hover { transform: translateY(-3px); border-color: var(--card-accent); background: rgba(255,255,255,.055); }
+.phase-card::after { content: ''; position: absolute; top: 22px; right: -17px; width: 20px; height: 1px; background: var(--border); }
+.phase-card:last-child::after { display: none; }
+.phase-kicker { display:block; font-family:var(--font-mono); font-size:10px; color:var(--card-accent); letter-spacing:.8px; margin-bottom:10px; }
+.phase-name { display:block; font-size:17px; font-weight:700; margin-bottom:9px; }
+.phase-question { display:block; color:var(--text-secondary); font-size:12.5px; line-height:1.55; }
+.phase-output { display:block; margin-top:13px; font-family:var(--font-mono); font-size:10.5px; color:var(--text-muted); }
+.reader-grid { display:grid; grid-template-columns:1.18fr .82fr; gap:18px; margin-top:24px; }
+.reader-card { border:1px solid var(--border); border-radius:12px; padding:19px; background:var(--bg-secondary); }
+.reader-card h3 { font-size:13px; margin-bottom:12px; color:var(--text-primary); }
+.reader-card ol { margin:0; padding-left:20px; color:var(--text-secondary); font-size:12.5px; line-height:1.75; }
+.reader-card li + li { margin-top:5px; }
+.counter-list { display:grid; gap:8px; }
+.counter-item { display:grid; grid-template-columns: 170px 1fr; gap:10px; padding:9px 0; border-bottom:1px solid rgba(48,54,61,.65); font-size:12px; color:var(--text-secondary); }
+.counter-item:last-child { border-bottom:0; padding-bottom:0; }
+.counter-item code { color:var(--accent-cyan); font-family:var(--font-mono); font-size:11px; }
+.counter-item span { line-height:1.5; }
+.checkpoint { display:flex; align-items:flex-start; gap:11px; padding:12px 15px; margin:24px 0 18px; border-radius:8px; background:rgba(88,166,255,.06); border:1px solid rgba(88,166,255,.18); color:var(--text-secondary); font-size:13px; line-height:1.65; }
+.checkpoint b { color:var(--accent-api); white-space:nowrap; }
+.journey-board { position:relative; display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:0; margin:30px 0 12px; overflow:hidden; border:1px solid var(--border); border-radius:14px; background:var(--bg-secondary); }
+.journey-node { position:relative; min-height:148px; padding:18px 15px 16px; border-right:1px solid var(--border); }
+.journey-node:last-child { border-right:0; }
+.journey-index { display:block; margin-bottom:13px; font-family:var(--font-mono); font-size:10px; letter-spacing:1px; color:var(--node-accent); }
+.journey-node strong { display:block; font-size:15px; margin-bottom:7px; }
+.journey-node p { color:var(--text-secondary); font-size:12px; line-height:1.52; }
+.journey-artifact { display:inline-block; margin-top:12px; padding:3px 6px; border-radius:4px; background:rgba(255,255,255,.05); color:var(--node-accent); font-family:var(--font-mono); font-size:10px; }
+.journey-caption { display:flex; justify-content:space-between; gap:12px; color:var(--text-muted); font-size:11px; margin:10px 2px 0; }
+
+/* ─── Progressive disclosure ─── */
+details.deep-dive { margin:34px 0 4px; border:1px solid var(--border); border-radius:12px; background:rgba(255,255,255,.015); overflow:hidden; }
+details.deep-dive > summary { list-style:none; cursor:pointer; padding:16px 18px; color:var(--text-primary); font-size:14px; font-weight:600; background:rgba(255,255,255,.025); }
+details.deep-dive > summary::-webkit-details-marker { display:none; }
+details.deep-dive > summary::before { content:'+'; display:inline-flex; align-items:center; justify-content:center; width:20px; height:20px; margin-right:10px; border-radius:50%; background:rgba(88,166,255,.14); color:var(--accent-api); font-family:var(--font-mono); font-size:15px; vertical-align:-1px; }
+details.deep-dive[open] > summary { border-bottom:1px solid var(--border); }
+details.deep-dive[open] > summary::before { content:'−'; }
+.deep-dive-hint { float:right; color:var(--text-muted); font-size:11px; font-weight:400; }
+.deep-dive-body { padding:8px 24px 28px; }
+.deep-dive-body > .diagram-title:first-child { margin-top:18px; }
 
 /* ─── Hero ─── */
 .hero { padding: 120px 40px 80px; text-align: center; border-bottom: 1px solid var(--border); }
@@ -211,6 +260,21 @@ body {
   .section-title { font-size: 24px; }
   .section { padding: 40px 20px 60px; }
   .menu-toggle { display: flex !important; }
+  .phase-ribbon { grid-template-columns: 1fr 1fr; }
+  .phase-card::after { display:none; }
+  .reader-grid { grid-template-columns:1fr; }
+  .journey-board { grid-template-columns:repeat(3,1fr); }
+  .journey-node:nth-child(3) { border-right:0; }
+  .journey-node:nth-child(-n+3) { border-bottom:1px solid var(--border); }
+}
+@media (max-width: 520px) {
+  .phase-ribbon { grid-template-columns:1fr; }
+  .counter-item { grid-template-columns:1fr; gap:3px; }
+  .journey-board { grid-template-columns:1fr; }
+  .journey-node, .journey-node:nth-child(3) { border-right:0; border-bottom:1px solid var(--border); }
+  .journey-node:last-child { border-bottom:0; }
+  .journey-caption { display:block; line-height:1.6; }
+  .deep-dive-hint { display:none; }
 }
 .menu-toggle {
   display: none; position: fixed; top: 12px; left: 12px; z-index: 200;
@@ -253,25 +317,26 @@ body {
     <h2>vLLM V1 执行内核</h2>
     <span>busy loop → spec decode 深入</span>
   </div>
-  <a href="#overview" class="active">全局视角与定位</a>
-  <div class="nav-group">EngineCore 主循环</div>
-  <a href="#busy-loop"><span class="badge badge-engine">&#8635;</span>run_busy_loop</a>
-  <div class="nav-group">step() 四阶段</div>
-  <a href="#schedule"><span class="badge badge-engine">P1</span>schedule + KV cache</a>
-  <a href="#exec"><span class="badge badge-worker">P2</span>model executor</a>
-  <a href="#sampling"><span class="badge badge-return">P3</span>sampling</a>
-  <a href="#spec"><span class="badge badge-cross">P4</span>spec decode</a>
-  <div class="nav-group">附录</div>
-  <a href="#summary">完整时序与数据流转</a>
-  <a href="#reading">代码阅读顺序</a>
+  <div class="nav-group">先跑通主线</div>
+  <a href="#reader-map"><span class="badge badge-api">00</span>5 分钟总览</a>
+  <a href="#overview" class="active">谁驱动闭环</a>
+  <a href="#busy-loop"><span class="badge badge-engine">01</span>控制循环</a>
+  <div class="nav-group">构建一次 step</div>
+  <a href="#schedule"><span class="badge badge-engine">02</span>调度与 KV 准入</a>
+  <a href="#exec"><span class="badge badge-worker">03</span>GPU 执行</a>
+  <a href="#sampling"><span class="badge badge-return">04</span>采样与同步</a>
+  <a href="#spec"><span class="badge badge-cross">05</span>Spec Decode</a>
+  <div class="nav-group">按需回查</div>
+  <a href="#summary">时序与对象流转</a>
+  <a href="#reading">源码阅读路线</a>
 </nav>
 
 <div class="main">
 
 <!-- ═══════ HERO ═══════ -->
 <section class="hero" id="top">
-  <div class="hero-title">vLLM V1 执行内核深入</div>
-  <div class="hero-sub">从 run_busy_loop 到 schedule、KV cache 规划分配、模型运行、sampling 到 spec decode</div>
+  <div class="hero-title">一轮 step，如何产出下一个 token</div>
+  <div class="hero-sub">vLLM V1 源码导读：先跑通主线，再按需展开 KV cache、GPU 执行、采样与 spec decode</div>
   <div class="hero-tags">
     <span class="hero-tag" style="background:rgba(63,185,80,0.1);color:var(--accent-engine)"><i style="font-size:18px">&#9672;</i> EngineCore</span>
     <span class="hero-tag" style="background:rgba(39,210,192,0.1);color:var(--accent-cyan)"><i style="font-size:18px">&#9672;</i> KV Cache</span>
@@ -279,14 +344,80 @@ body {
     <span class="hero-tag" style="background:rgba(210,153,34,0.1);color:var(--accent-ipc)"><i style="font-size:18px">&#9672;</i> Spec Decode</span>
   </div>
   <div style="margin-top:40px; font-size:13px; color:var(--text-muted)">
-    核对基准：vLLM tag <strong style="color:var(--accent-engine)">v0.24.0</strong> (commit ee0da84ab) &nbsp;|&nbsp; request.md 的深入篇
+    核对基准：vLLM tag <strong style="color:var(--accent-engine)">v0.25.1</strong> (commit 752a3a504) &nbsp;|&nbsp; request.md 的深入篇
+  </div>
+</section>
+
+<!-- ═══════ READER MAP ═══════ -->
+<section class="section reader-map" id="reader-map">
+  <div class="section-label" style="color:var(--accent-api)">Read this first · 5 minutes</div>
+  <div class="section-title">先跑通一次普通 decode，再进入细节</div>
+  <p class="map-intro">先假设没有多模态、没有 spec decode，且一个请求已经进入 decode。下面五步就是全文的骨架：每一章只是在解释其中一个节点如何面对 KV cache、约束输出或异步执行。</p>
+
+  <div class="journey-board" aria-label="一次普通 decode 的五步旅程">
+    <div class="journey-node" style="--node-accent:var(--accent-api)"><span class="journey-index">01 · REQUEST</span><strong>请求就绪</strong><p>新请求留在 waiting；已生成的请求留在 running。</p><span class="journey-artifact">Request</span></div>
+    <div class="journey-node" style="--node-accent:var(--accent-engine)"><span class="journey-index">02 · SCHEDULE</span><strong>决定本轮工作</strong><p>选择请求、裁剪 token 数，并为新位置取得 KV block。</p><span class="journey-artifact">SchedulerOutput</span></div>
+    <div class="journey-node" style="--node-accent:var(--accent-worker)"><span class="journey-index">03 · FORWARD</span><strong>GPU 做 forward</strong><p>把 token、position、block table 组织为模型输入；logits 留在设备侧。</p><span class="journey-artifact">GPU logits</span></div>
+    <div class="journey-node" style="--node-accent:var(--accent-purple)"><span class="journey-index">04 · SAMPLE</span><strong>采样成 token</strong><p>应用约束与采样策略；只在 CPU 记账需要时同步。</p><span class="journey-artifact">ModelRunnerOutput</span></div>
+    <div class="journey-node" style="--node-accent:var(--accent-ipc)"><span class="journey-index">05 · UPDATE</span><strong>提交或结束</strong><p>更新 Request、处理 stop、释放资源；未结束则回到调度。</p><span class="journey-artifact">EngineCoreOutputs</span></div>
+  </div>
+  <div class="journey-caption"><span>普通 decode：第 02 → 05 步通常只产生一个新 token。</span><span>Spec decode：仍是这五步，只是一次验证多个候选 token。</span></div>
+
+  <div class="phase-ribbon" aria-label="一次 step 的四个阶段">
+    <a class="phase-card" href="#schedule" style="--card-accent:var(--accent-engine)">
+      <span class="phase-kicker">PHASE 1 · CPU</span>
+      <span class="phase-name">schedule</span>
+      <span class="phase-question">这一步谁能跑？每个请求拿到多少 token 与多少 KV block？</span>
+      <span class="phase-output">→ SchedulerOutput</span>
+    </a>
+    <a class="phase-card" href="#exec" style="--card-accent:var(--accent-worker)">
+      <span class="phase-kicker">PHASE 2 · GPU</span>
+      <span class="phase-name">execute_model</span>
+      <span class="phase-question">把 token、position、block table 组装为一次 forward；logits 暂留 GPU。</span>
+      <span class="phase-output">→ ExecuteModelState.logits</span>
+    </a>
+    <a class="phase-card" href="#sampling" style="--card-accent:var(--accent-purple)">
+      <span class="phase-kicker">PHASE 3 · GPU → CPU</span>
+      <span class="phase-name">sample_tokens</span>
+      <span class="phase-question">约束 logits、采样 token；只在 CPU 记账所需的位置同步一次。</span>
+      <span class="phase-output">→ ModelRunnerOutput</span>
+    </a>
+    <a class="phase-card" href="#spec" style="--card-accent:var(--accent-ipc)">
+      <span class="phase-kicker">PHASE 4 · CPU</span>
+      <span class="phase-name">update_from_output</span>
+      <span class="phase-question">提交 token、结束请求；有 draft 时接受或回滚，再进入下一步。</span>
+      <span class="phase-output">→ EngineCoreOutputs</span>
+    </a>
+  </div>
+
+  <div class="checkpoint"><b>阅读规则</b><span>第一次只跟绿色 → 橙色 → 紫色 → 黄色的主线；遇到 MLA、Mamba、Hybrid、多模态或 proposer 清单时可以先跳过。它们不会改变 <code>schedule → forward → sample → update</code> 这个闭环。</span></div>
+
+  <div class="reader-grid">
+    <div class="reader-card">
+      <h3>推荐阅读方式</h3>
+      <ol>
+        <li>先读「全局视角」和「busy loop」，明确输入线程、主线程、输出线程谁负责什么。</li>
+        <li>按 P1 → P2 → P3 跟一遍<strong>普通 decode</strong>；先跳过 KV cache 的类型细节和 spec decode。</li>
+        <li>回到 P1 的 KV cache，理解“算多少 token”为什么同时意味着“分多少 block”。</li>
+        <li>最后读 spec decode：它只是让一次 forward 验证多个候选 token，仍沿用同一套计账闭环。</li>
+      </ol>
+    </div>
+    <div class="reader-card">
+      <h3>阅读时一直盯住的四个计数</h3>
+      <div class="counter-list">
+        <div class="counter-item"><code>num_computed_tokens</code><span>GPU 已计算到的位置；draft 被拒时会回退。</span></div>
+        <div class="counter-item"><code>num_tokens_with_spec</code><span>prompt + 输出 + 待验证 draft 的总长度。</span></div>
+        <div class="counter-item"><code>num_new_tokens</code><span>本轮实际送入模型的 token 数，受预算裁剪。</span></div>
+        <div class="counter-item"><code>num_output_placeholders</code><span>异步执行时预留的输出位置，用来保持 CPU/GPU 记账一致。</span></div>
+      </div>
+    </div>
   </div>
 </section>
 
 <!-- ═══════ OVERVIEW ═══════ -->
 <section class="section" id="overview">
-  <div class="section-label" style="color:var(--text-muted)">Where we zoom in</div>
-  <div class="section-title">全局视角与本文定位</div>
+  <div class="section-label" style="color:var(--text-muted)">Chapter 1 · Who drives the loop</div>
+  <div class="section-title">谁在驱动这条闭环</div>
 
   <p class="lead">本文放大 <code>EngineCore.step()</code> 内部四段——<strong>run busy loop → schedule（含 KV cache 规划与分配）→ model executor / 模型运行 → sampling → spec decode</strong>。所有 <code>file:line</code> 基于 v0.24.0 核对。</p>
 
@@ -340,8 +471,8 @@ body {
 
 <!-- ═══════ BUSY LOOP ═══════ -->
 <section class="section" id="busy-loop">
-  <div class="section-label" style="color:var(--accent-engine)">EngineCore 主驱动</div>
-  <div class="section-title">run_busy_loop：EngineCore 的主驱动循环</div>
+  <div class="section-label" style="color:var(--accent-engine)">Chapter 2 · Control loop</div>
+  <div class="section-title">控制循环：何时等输入，何时连续 step</div>
 
   <div class="diagram-title">进程 / 线程模型 — 三队列 + 两 socket 线程</div>
   <div class="diagram-box">
@@ -455,10 +586,11 @@ sequenceDiagram
 
 <!-- ═══════ SCHEDULE ═══════ -->
 <section class="section" id="schedule">
-  <div class="section-label" style="color:var(--accent-engine)">Phase 1</div>
-  <div class="section-title">schedule — 调度与 KV cache 规划分配</div>
+  <div class="section-label" style="color:var(--accent-engine)">Chapter 3 · Decide the work</div>
+  <div class="section-title">调度与 KV 准入：决定本轮做什么</div>
 
   <p class="lead"><code>Scheduler.schedule()</code>（scheduler.py:388）不区分 prefill/decode phase，而用统一 token 记账把 chunked prefill、prefix cache、spec decode 全部纳入。</p>
+  <div class="checkpoint"><b>本节只抓一件事</b><span><code>schedule()</code> 不生成 token；它把“逻辑上的 token 工作量”翻译成“可执行的 token 数 + 可写入的 KV block”。先跟住 <code>num_new_tokens</code>，再看分配失败时为何 RUNNING 会抢占而 WAITING 会停在队列里。</span></div>
 
   <div class="diagram-title">统一记账 — scheduler.py:390-399</div>
   <div class="diagram-box">
@@ -598,7 +730,9 @@ flowchart LR
     <span class="path">scheduler.py</span><span class="line">:1107</span> _preempt_request
   </div>
 
-  <div style="height:1px;background:var(--border);margin:40px 0"></div>
+  <details class="deep-dive">
+    <summary>进阶：KV cache 的格式、MLA / Mamba 与 Hybrid 模型<span class="deep-dive-hint">首次阅读可跳过</span></summary>
+    <div class="deep-dive-body">
   <div class="diagram-title" style="font-size:18px;color:var(--text-primary);margin-bottom:8px">KV cache 的种类：Full Attention / MLA / SparseMLA / Linear 状态缓存</div>
   <p class="lead">前面讲的 allocate_slots / prefix cache / 抢占都是<strong>机制</strong>，跟"缓存存什么"无关。<code>KVCacheSpec</code>（每层一份）描述"存什么、block 多大"，<code>SingleTypeKVCacheManager</code> 描述"怎么分配/命中/释放"。spec 决定内容与尺寸，manager 决定调度行为，注册表绑定（<code>single_type_kv_cache_manager.py:1380-1415</code>）。</p>
 
@@ -856,14 +990,203 @@ flowchart TB
   <div class="callout"><strong>命中定点迭代</strong>（<code>find_longest_cache_hit</code> <code>:622-732</code>）：full-attn 左→右给紧上界，sliding 右→左查窗口，任一组缩短就重查，收敛到公共前缀。</div>
   <div class="callout"><strong>分配 fan-out</strong>：<code>get_num_blocks_to_allocate</code> 两 group 相加；<code>allocate_new_blocks</code> 每组各返一份。同一 R1：group0 持 <code>[#0,#1]</code>、group1 持 <code>[#5,#6]</code>——两份独立 <code>req_to_blocks</code>，但都从同一 <code>BlockPool</code> 取。每层有自己的 KV 张量，但 <strong>block_table 跨层共享</strong>（同串 id 对所有层用）。</div>
   <div class="callout"><strong>一句话总括</strong>：<code>KVCacheSpec</code>（加载期定 group/manager/block 大小）→ <code>KVCacheManager</code>（门面）→ <code>KVCacheCoordinator</code>（跨组策略）→ <code>SingleTypeKVCacheManager</code>/<code>FullAttentionManager</code>（组内 per-request 记账 + 命中/分配）→ <code>BlockPool</code>（物理 block 的 LRU + 哈希）。六者各管一层，靠委托链串起来。</div>
+    </div>
+  </details>
+  <!-- ─── 3.3.14 加载期规划 ─── -->
+  <div class="diagram-title" style="font-size:18px;color:var(--text-primary);margin:44px 0 8px">3.3.14 加载期规划：从 KVCacheSpec 到 group 与 num_blocks</div>
+  <p class="lead">3.3.1–3.3.13 讲的是<strong>运行时</strong>怎么分配/命中/释放 block。但有两个上游问题一直没回答：① 这些 group 是怎么从每层的 <code>KVCacheSpec</code> 分出来的？② 池子里到底有多少个 block（<code>num_blocks</code>）是怎么从可用显存算出来的？这一节补这个洞——它发生在<strong>引擎初始化时一次</strong>，产出的 <code>KVCacheConfig</code>（groups + num_blocks）是后面所有运行时记账的基准。</p>
+  <div class="callout"><strong>版本说明</strong>：本节 <code>file:line</code> 基于 <code>glm5_next</code> 工作树（含本地 commit <code>08f98cd5c</code> "refine kv cache group"），与全文的 v0.25.1 基准不同。<strong>分组决策树、num_blocks、max_concurrency 这套机制跨版本稳定</strong>；带 ★ 的是本地改动（mamba 均衡分组 + 多层组内存核算）。</div>
+
+  <div class="diagram-title">数据流总览（单页）—— spec → group → num_blocks → max_concurrency</div>
+  <div class="diagram-box"><div class="callstack">输入（加载期，每模型一次）
+  kv_cache_spec    : dict[layer_name → KVCacheSpec]   每层一份（spec 层级见 3.3.6）
+  available_memory : int                             profiling 出的 KV 可用显存
+                       │
+                       ▼
+  get_kv_cache_groups(vllm_config, kv_cache_spec)              kv_cache_utils.py:1809
+     分组决策树（早返回级联，从特殊→一般，详见 (1)）：
+       uniform_spec → uniform_type → grouped(DSv4) → 通用混合 ★
+                                                  (抽 mamba → attention 凑等大
+                                                   → mamba 按位置均衡分桶加回)
+                       │
+                       ▼
+              list[KVCacheGroupSpec]            每 group = (layer_names, kv_cache_spec)
+                       │
+                       ▼
+  get_kv_cache_config_from_groups(groups, available_memory)     kv_cache_utils.py:1340
+     total_page = Σ _group_bytes_per_block(g)                    :1395   ← (4) 每 group 字节核算
+                    ├─ UniformType : page_size          (已含多层)
+                    └─ 普通        : page_size × len(layer_names)   ★
+     num_blocks  = available_memory // total_page
+                  → may_override_num_blocks  (应用 --num-blocks 覆盖 / watermark)
+                       │
+                       ▼
+           KVCacheConfig(num_blocks, kv_cache_groups, kv_cache_tensors)
+                       │
+         ┌─────────────┼─────────────────────────┐
+         ▼             ▼                         ▼
+   运行时消费者     get_max_concurrency_for_kv_cache_config   其它
+   - KVCacheManager   kv_cache_utils.py:920                    - /metrics 上报
+   - gpu_model_runner max_mem/req = Σ max_memory × len(layers)   KV token 容量
+   - NiXL PD 握手       (_max_memory_usage_bytes_from_groups :1950) ★
+                       mem/block   = _pool_bytes_per_block(...)
+                          (4 分支：单UniformType/packed/混合★/通用)
+                       max_concurrency = num_blocks / cdiv(max_mem/req, mem/block)</div></div>
+  <p>一句话：<strong>spec → <code>get_kv_cache_groups</code> 分组 → <code>Σ _group_bytes_per_block</code> 算 total_page → <code>available // total_page</code> 得 num_blocks → <code>num_blocks / (max_mem÷mem_per_block)</code> 得 max_concurrency</strong>。其中 <code>_group_bytes_per_block</code> 的 <code>× len(layer_names)</code>（★）是多层组不漏算内存的关键。</p>
+
+  <div class="diagram-title" style="color:var(--accent-engine)">(1) 分组决策树 — get_kv_cache_groups (kv_cache_utils.py:1809)</div>
+  <p>输入 <code>{layer_name: KVCacheSpec}</code>，输出 <code>list[KVCacheGroupSpec]</code>。是一条<strong>早返回级联</strong>，从最特殊到最一般：</p>
+  <div class="diagram-box"><div class="callstack">get_kv_cache_groups(vllm_config, kv_cache_spec)                 kv_cache_utils.py:1809
+  ├─ disable_hybrid_kv_cache_manager? → unify_hybrid_kv_cache_specs   强制把所有 spec 同化成一种
+  ├─ attention-free 模型?        → return []                          :1825
+  ├─ 所有层 spec 完全相同?        → _get_kv_cache_groups_uniform_spec  (1 个大 group)   :1830  def :1012
+  ├─ 所有层"等价类型"(等 token 槽数)? → UniformTypeKVCacheSpecs.from_specs
+  │      └─ _get_kv_cache_groups_uniform_type  (1 个 group)            :1835  def :1029
+  │      例：全是 full-attn，或全是等窗 SWA
+  ├─ 可分组+统一 (DeepseekV4)?   → group_and_unify_kv_cache_specs
+  │      └─ _get_kv_cache_groups_uniform_groups (多个 UniformType group) :1840  def :1684
+  │      例：等槽数但类型/尺寸不同（full + 多种 SWA）
+  └─ 【通用混合路径】★                                                 :1848+
+         抽出 HiddenStateCacheSpec / MambaSpec → 剩余 attention 凑等大 page
+         → 把抽出的 mamba 按位置均衡加回（见 (2)）</div></div>
+  <table class="data-table">
+    <thead><tr><th>场景</th><th>命中分支</th><th>典型模型</th></tr></thead>
+    <tbody>
+      <tr><td>纯 full-attn</td><td>uniform_spec</td><td>Llama / Qwen 等绝大多数</td></tr>
+      <tr><td>MLA + indexer（等槽）</td><td>uniform_type</td><td>DeepSeek-V3.2 sparse MLA</td></tr>
+      <tr><td>full + 多种 SWA（等槽）</td><td>grouped（DSv4）</td><td>DeepSeek-V4</td></tr>
+      <tr><td>full/MLA + Mamba/线性（不等槽）</td><td>通用混合 ★</td><td>Jamba / Nemotron-H / KimiLinear / <strong>GLM-5Next</strong></td></tr>
+    </tbody>
+  </table>
+
+  <div class="diagram-title" style="color:var(--accent-engine)">(2) 通用混合路径：抽出 + 凑等大 + 均衡加回 ★（本地改动）</div>
+  <p>hybrid 模型（attention + Mamba/线性）走的路，<code>get_kv_cache_groups</code> 末尾（<code>:1848</code>）：</p>
+  <div class="diagram-box"><div class="callstack">① 抽出 hidden_specs (HiddenStateCacheSpec) 和 mamba_specs (MambaSpec) → filtered_spec 只剩 attention
+② filtered_spec 再走 uniform_type / uniform_page_size 分组（attention 层之间凑等大 page）
+③ hidden 层按 common_page 对齐后逐层成组
+④ ★ mamba 层不再"每层一组"，按"在每段连续 mamba run 中的位置"分桶成少数几个均衡组   :1898-1909</div></div>
+  <p>④ 的分桶：遍历层序，遇到非 mamba（attention）就把 <code>run_pos</code> 归零；mamba 层按 <code>run_pos</code> 进对应桶。注释例子 <code>(M,M,M,A)×11 + M</code> → 3 个组，分别 12/11/11 层。<strong>为什么均衡而不是每层一组</strong>：原来每个 mamba 层各自一组（N 组 = N 个 block table + N 份 per-group 记账）；均衡后 ~3 个组，组数/block-table 数大幅减少。注意 mamba 是 O(1)/request 的固定 state（见 3.3.10），<strong>无论怎么分组总字节数不变</strong>——均衡只改"怎么打包"，不改"占多少"。</p>
+
+  <div class="diagram-title" style="color:var(--accent-engine)">(3) num_blocks 核算 — get_kv_cache_config_from_groups (:1340)</div>
+  <div class="diagram-box"><div class="callstack">total_page_size = Σ _group_bytes_per_block(group)            :1395   一个 block 跨所有 group 的总字节
+num_blocks      = available_memory // total_page
+                 （再经 may_override_num_blocks 应用 --num-blocks 覆盖 / watermark）</div></div>
+  <p>每层一个物理 tensor，<code>num_blocks</code> 是它们<strong>共享的块数</strong>（同一物理 block id 被所有层复用，见 3.3.7）。<code>available_memory</code> 是 profiling 出的 KV 可用显存。</p>
+
+  <div class="diagram-title" style="color:var(--accent-engine)">(4) 每 group 字节核算 — _group_bytes_per_block (:947) + _pool_bytes_per_block (:954)</div>
+  <div class="diagram-box"><div class="callstack">_group_bytes_per_block(group):                          :947   多层组的关键
+  if isinstance(spec, UniformTypeKVCacheSpecs):
+      return spec.page_size_bytes          # UniformType 已含多层，直接用
+  return spec.page_size_bytes × len(group.layer_names)   # ★ 普通 spec：× 层数</div></div>
+  <table class="data-table">
+    <thead><tr><th>_pool_bytes_per_block 分支</th><th>条件</th><th>公式</th></tr></thead>
+    <tbody>
+      <tr><td>单 UniformType 组</td><td>1 group 且是 UniformType</td><td><code>spec.page_size_bytes</code></td></tr>
+      <tr><td>packed 分配</td><td><code>_use_packed_kv_cache_config</code></td><td><code>Σ page_size × 该桶层数</code></td></tr>
+      <tr><td>混合（UniformType + 其它）★</td><td>有 UniformType 又有 Mamba 等</td><td><code>Σ _group_bytes_per_block(g)</code></td></tr>
+      <tr><td>通用</td><td>其余（纯 full+SWA 等）</td><td><code>uniform_page_size × max(group_size)</code></td></tr>
+    </tbody>
+  </table>
+  <div class="callout warn"><strong>★ 这个 <code>× len(layer_names)</code> 是本 commit 修的 bug</strong>：<code>page_size_bytes</code> 是<strong>单层</strong>的，多层组（如均衡后的 12 层 mamba 组）必须乘层数，否则 <code>_pool_bytes_per_block</code> / <code>_max_memory_usage</code> 会<strong>少算</strong> → <code>num_blocks</code> 偏大、<code>max_concurrency</code> 偏高 → 实际跑起来<strong>超出显存 / OOM</strong>。原来 mamba 每层一组（×1）所以"碰巧"对；一旦改成均衡多层组就必须乘。<strong>两者是耦合的改动</strong>——分组（②）创造多层组，核算（④）才需要乘层数；缺一不可。</div>
+
+  <div class="diagram-title" style="color:var(--accent-engine)">(5) 最大并发 — get_max_concurrency_for_kv_cache_config (:920)</div>
+  <div class="diagram-box"><div class="callstack">max_memory_per_request = _max_memory_usage_bytes_from_groups(...)   :1950   单请求最大 KV 占用
+memory_per_block       = _pool_bytes_per_block(...)                          每 block 字节
+num_block_per_request  = cdiv(max_memory_per_request, memory_per_block)
+max_concurrency        = num_blocks / num_block_per_request</div></div>
+  <p><code>_max_memory_usage_bytes_from_groups</code>（<code>:1950</code>）同样要 <code>× len(layer_names)</code>（<code>:2011</code>）：每个物理层都有状态，单组多层要按层累加。旧版用 <code>max(group_size) × 单一 per-group 内存</code> 的近似，对异构 hybrid 不准——本 commit 改成逐组精确累加。</p>
+
+  <div class="diagram-title" style="color:var(--accent-engine)">(6) 实例：GLM-5Next（测试 test_get_kv_cache_config_balanced_mamba_hybrid）</div>
+  <p>45 层：每 4 层一段，第 4 层是 <code>MLA + indexer</code>（11 段 attention = 22 个层名），其余 34 层是 mamba/KDA。<code>get_kv_cache_groups</code> 产出 <strong>4 个 group</strong>：</p>
+  <div class="diagram-box"><div class="callstack">group 0 : UniformTypeKVCacheSpecs (MLA + indexer)   22 层名 / 11 物理层
+group 1 : MambaSpec               12 层     ┐
+group 2 : MambaSpec               11 层     ├ 均衡三组 (12+11+11 = 34)
+group 3 : MambaSpec               11 层     ┘</div></div>
+  <p>测试断言（验证内存不漏算）：<code>max_memory == Σ 每层 max_memory_usage_bytes</code>；<code>bytes_per_block == Σ 每层 page_size_bytes</code>；<code>num_blocks == available // bytes_per_block == 100</code>；45 个 tensor = 11 个 <code>shared_by==2</code>（MLA/indexer 共享一块）+ 34 个 <code>shared_by==1</code>（mamba）；<code>max_concurrency == 100 / blocks_per_request</code>。</p>
+
+  <div class="diagram-title">要点速记</div>
+  <div class="callout"><strong>加载期 vs 运行时</strong>：group 分法 + num_blocks 是<strong>一次</strong>定的（本节）；allocate_slots/命中/抢占是<strong>每步</strong>的（3.3.1–3.3.5）。后者以前者为基准。</div>
+  <div class="callout"><strong>多层组必须 <code>× len(layer_names)</code></strong>，否则少算内存 → OOM。<code>UniformTypeKVCacheSpecs</code> 已含多层，别重复乘。</div>
+  <div class="callout"><strong>mamba 均衡分组改的是打包方式</strong>（组数↓、block-table↓），不改总字节数。</div>
+  <div class="callout"><strong>和 PD disagg 的衔接</strong>：NiXL 握手时 D 侧按这里的 group/page 核算来对齐 <code>block_len</code>；这里算错，PD 的 region 大小也跟着错。</div>
+  <div class="callout"><strong>上游查重</strong>：已有 open PR（#40384 排除 O(1) mamba 组 / #41124 mamba <code>block_size=None</code>）在修同一片区域，独立提交前需先对齐。</div>
+
+  <!-- ─── 3.3.15 DSv4 Packed ─── -->
+  <div class="diagram-title" style="font-size:18px;color:var(--text-primary);margin:44px 0 8px">3.3.15 DSv4 Packed KV cache：多层共享一个物理 tensor</div>
+  <p class="lead">3.3.7 说"每层一个 KV tensor"。DSv4 打破了这个默认——它把所有层（同 page size）的 per-block KV 数据<strong>打包进同一个物理 tensor</strong>，每层只是这块内存的一个 strided view（按 <code>storage_offset</code> 切出自己的区域）。这是 DeepSeek-V4 的标志性内存布局优化。本节基于 v0.25.1。</p>
+
+  <div class="diagram-title" style="color:var(--accent-engine)">(1) 为什么 packed</div>
+  <p>DSv4 全是 <code>UniformTypeKVCacheSpecs</code>（等 token 槽数、同 page size），层数多。默认"每层一个 tensor"会得到 N 个独立分配 + N 个碎片化区域；packed 则<strong>一个物理 tensor，所有层 view 共享、per-block 数据连续</strong>——内存局部性好、分配开销低、下游（如 NiXL）只需注册一个 region。</p>
+
+  <div class="diagram-title" style="color:var(--accent-engine)">(2) 何时启用 — _use_packed_kv_cache_config (kv_cache_utils.py:1255)</div>
+  <div class="diagram-box"><div class="callstack">is_dsv4 = 所有 group 都是 UniformTypeKVCacheSpecs
+return is_dsv4 or (enable_cross_layers_blocks=True and 多 group)   # 后者是实验 API（issue #42082）</div></div>
+  <p>即：DSv4 默认走 packed；其它多 group 模型可用 <code>enable_cross_layers_blocks</code> 显式 opt in。</p>
+
+  <div class="diagram-title" style="color:var(--accent-engine)">(3) 规划 packed 布局 — _get_kv_cache_config_packed (:1277，别名 _get_kv_cache_config_deepseek_v4)</div>
+  <div class="diagram-box"><div class="callstack">① _bucket_layers_by_page_size(groups)            :1230
+     buckets = {page_size: [[layer@slot0], [layer@slot1], ...]}
+     规则：同一 (page_size, slot_idx) 的不同 group 的层共享一个 tensor
+           （它们各有独立 block_table，block-id 命名空间不冲突）
+② total_num_bytes_per_block = Σ page_size × len(slots)        一个 block 跨所有 slot 的总字节
+③ num_blocks = available_memory // total_num_bytes_per_block
+④ ONE 物理分配 total_size = total_num_bytes_per_block × num_blocks
+⑤ 每个 KVCacheTensor(size=total_size, shared_by=slot,
+                     offset=byte_offset,              # ★ 块内字节偏移，逐 slot 累加 ps
+                     block_stride=total_num_bytes_per_block)  # ★ packed 时每 block 总字节
+   byte_offset += ps    # 逐 slot</div></div>
+
+  <div class="diagram-title" style="color:var(--accent-engine)">(4) KVCacheTensor 的两个新字段 (kv_cache_interface.py:893)</div>
+  <table class="data-table">
+    <thead><tr><th>字段</th><th>含义</th></tr></thead>
+    <tbody>
+      <tr><td><code>offset</code></td><td>该层在<strong>一个连续 block 内</strong>的字节偏移（packed 才用）</td></tr>
+      <tr><td><code>block_stride</code></td><td>packed 布局下<strong>每 block 总字节</strong>；<code>0</code> = 非 packed（每层独占 tensor）</td></tr>
+    </tbody>
+  </table>
+
+  <div class="diagram-title" style="color:var(--accent-engine)">(5) runner 侧物化 — _allocate_kv_cache_raw_tensors (gpu_model_runner.py:7095) + _reshape_kv_cache_tensors (:7133)</div>
+  <div class="diagram-box"><div class="callstack">分配：if block_stride &gt; 0:
+          packed_backing = torch.zeros(total_size, int8)   # 只 new 一次
+          所有 packed KVCacheTensor 的 raw_tensor = packed_backing   # alias 同一块内存
+      else: 每层独立 torch.zeros(...)
+reshape：layer_packing[layer] = (offset, block_stride)        :7154
+         _reshape_attention_kv_cache(raw, shape, ..., packing)
+           └─ torch.as_strided(raw.view(dtype), shape, stride,
+                               storage_offset = offset // dtype_size)  # ★ 每层按 offset 切 view</div></div>
+  <p>所以"共享一个 tensor"= 多层是<strong>同一块 int8 内存的 strided view</strong>，靠 <code>storage_offset</code> 区分各自的数据。</p>
+
+  <div class="diagram-title" style="color:var(--accent-engine)">(6) 内存布局对比</div>
+  <div class="diagram-box"><div class="callstack">默认（per-layer，非 packed）：每层一个独立 tensor
+  layer0: [blk0][blk1][blk2]...   ← tensor A  ┐
+  layer1: [blk0][blk1][blk2]...   ← tensor B  ├ 各自独立分配
+  layer2: [blk0][blk1][blk2]...   ← tensor C  ┘
+
+DSv4 packed：所有层 view 进同一个物理 tensor（block_stride = Σ ps）
+  packed_backing (int8, total_size):
+  byte   0      ps0    ps0+ps1              block_stride
+        ├ slot0 ┤ slot1 ┤ slot2 ┤ ... ┤
+  blk0  [layer0 ][layer1 ][layer2 ] ... [ ]     ← storage_offset: 0 / ps0 / ps0+ps1
+  blk1  [layer0 ][layer1 ][layer2 ] ... [ ]     ← +1×block_stride
+  blk2  [layer0 ][layer1 ][layer2 ] ... [ ]     ← +2×block_stride
+
+  layer_i = as_strided(packed_backing, shape, stride, storage_offset = offset_i)   # 同一块内存的不同视图</div></div>
+  <p>block 寻址：layer L（在 slot s、offset <code>o_s</code>、page_size <code>ps_s</code>）的 block b 起始字节 = <code>b × block_stride + o_s</code>，长度 <code>ps_s</code>。</p>
+
+  <div class="diagram-title">要点速记</div>
+  <div class="callout"><strong>packed 只改物理分配</strong>（一个 tensor vs N 个），<strong>不改 block_table 语义</strong>——每 group/层仍各有自己的 block_table，只是它们最终都索引进同一个物理 backing 的不同 offset。</div>
+  <div class="callout"><strong>NiXL 受益</strong>：<code>register_kv_caches</code> 有 packed fast-path，所有层 strided view 同一 storage 时只注册<strong>一个</strong> NIXL region（而不是 N 个），减少描述符开销。</div>
+  <div class="callout warn"><strong>packed ≠ co-location</strong>：packed 是 DSv4（全 UniformType）的"全层共享一个 backing"；GLM-5Next 的 MLA+indexer 那种"成对共享"（<code>shared_by=[idx, mla]</code>，3.3.14 提到）是 co-location，走的是 glm5_next 本地的 mixed 分支，<strong>不是</strong> packed——GLM-5Next 含 MambaSpec，不满足 <code>is_dsv4</code>。</div>
+  <div class="callout"><strong>不漏算内存</strong>：packed 下 <code>total_num_bytes_per_block</code> 已把所有 slot 的 ps 求和，<code>num_blocks</code> 据此算，不会像多层组那样需要额外 <code>× len</code>（见 3.3.14 的对比）。</div>
 </section>
 
 <!-- ═══════ EXEC ═══════ -->
 <section class="section" id="exec">
-  <div class="section-label" style="color:var(--accent-worker)">Phase 2</div>
-  <div class="section-title">model executor → 模型运行</div>
+  <div class="section-label" style="color:var(--accent-worker)">Chapter 4 · Execute on GPU</div>
+  <div class="section-title">GPU 执行：把调度计划变成 forward</div>
 
   <p class="lead"><code>model_executor</code> 在 <code>EngineCore.__init__</code> 构造（core.py:123），类型由 <code>Executor.get_class</code>（abstract.py:47）按 backend 选。</p>
+  <div class="checkpoint"><b>本节只抓一件事</b><span><code>SchedulerOutput</code> 是 CPU 对 Worker 的执行说明书。<code>execute_model(non_block=True)</code> 让 forward 开始后立刻返回 Future；主线程随即计算 grammar bitmask，最后才等待 GPU 完成。</span></div>
 
   <table class="data-table">
     <thead><tr><th>backend</th><th>类</th><th>文件:行</th></tr></thead>
@@ -928,7 +1251,9 @@ flowchart TB
     <span class="path">v1/worker/gpu_worker.py</span><span class="line">:836</span> Worker.execute_model
   </div>
 
-  <div style="height:1px;background:var(--border);margin:40px 0"></div>
+  <details class="deep-dive">
+    <summary>进阶：多模态 embedding、encoder cache 与 CUDA Graph<span class="deep-dive-hint">不改变文本主线</span></summary>
+    <div class="deep-dive-body">
   <div class="diagram-title" style="font-size:18px;color:var(--text-primary);margin-bottom:8px">多模态：MM embedding 如何进入 token 序列与 KV cache</div>
   <p class="lead">API 侧（renderer / <code>BaseMultiModalProcessor</code>）见 <code>request.md</code> Stage 3。本节只讲<strong>引擎侧</strong>。三个要点：</p>
   <div class="flow-steps">
@@ -1020,12 +1345,15 @@ flowchart TB
 <span class="comment">  → decoder cuda graph 不需为 MM 特化。</span>
 <span class="comment">• encoder-decoder 模型: 有 encoder input 时 skip_compiled=has_encoder_output (:4324)，强制不走 compiled/cuda graph。</span></div>
   </div>
+    </div>
+  </details>
 </section>
 
 <!-- ═══════ SAMPLING ═══════ -->
 <section class="section" id="sampling">
-  <div class="section-label" style="color:var(--accent-purple)">Phase 3</div>
-  <div class="section-title">sampling — 从 logits 到 token</div>
+  <div class="section-label" style="color:var(--accent-purple)">Chapter 5 · Turn logits into tokens</div>
+  <div class="section-title">采样与同步：从 logits 到可提交 token</div>
+  <div class="checkpoint"><b>本节只抓一件事</b><span>forward 后 logits 仍在 GPU。约束、top-k/top-p、Gumbel-max 与 spec rejection 都尽量留在 GPU；只有 Scheduler 需要更新 Python 状态时，<code>_bookkeeping_sync()</code> 才把 token id 物化到 CPU。</span></div>
 
   <div class="diagram-title">sample_tokens 全流程 — gpu_model_runner.py:4435</div>
   <div class="diagram-box">
@@ -1043,6 +1371,9 @@ flowchart TB
 <span class="comment">  └─</span> return ModelRunnerOutput（同步）/ AsyncGPUModelRunnerOutput（异步）      <span class="comment">:4637</span></div>
   </div>
 
+  <details class="deep-dive">
+    <summary>展开：grammar、Sampler 与唯一 GPU → CPU 同步点<span class="deep-dive-hint">主线已在上方完成</span></summary>
+    <div class="deep-dive-body">
   <div class="diagram-title">grammar bitmask — 与 forward 并行的设计</div>
   <div class="callout"><strong>为什么拆分</strong>：<code>step()</code> 在 <code>execute_model(non_block=True)</code> 后立刻调 <code>get_grammar_bitmask()</code>（core.py:491-492）。xgrammar FSM 遍历是纯 CPU 工作，被藏到 GPU forward 后面；等 <code>future.result()</code> 回来，bitmask 已算好。</div>
   <div class="diagram-box">
@@ -1108,14 +1439,17 @@ flowchart TB
     <span class="path-w">:3613/:7504</span> _bookkeeping_sync/_to_list &nbsp;|&nbsp;
     <span class="path-s">v1/structured_output/utils.py</span><span class="line">:85</span> apply_grammar_bitmask
   </div>
+    </div>
+  </details>
 </section>
 
 <!-- ═══════ SPEC DECODE ═══════ -->
 <section class="section" id="spec">
-  <div class="section-label" style="color:var(--accent-ipc)">Phase 4 → spec decode</div>
-  <div class="section-title">从 sampling 到 draft 验证</div>
+  <div class="section-label" style="color:var(--accent-ipc)">Chapter 6 · A variation of the same loop</div>
+  <div class="section-title">Spec decode：一次验证多个候选 token</div>
 
   <p class="lead">spec decode 是 <strong>propose → verify → accept/reject</strong> 的跨步循环，复用前文所有机制：draft 计入 <code>num_tokens_with_spec</code>、走 <code>allocate_slots</code>、一次 <code>execute_model</code> 验证、<code>RejectionSampler</code> 判定、<code>update_from_output</code> 回滚。</p>
+  <div class="checkpoint"><b>不要把它看成新管线</b><span>spec decode 的变化只有两点：本轮多调度 <code>K</code> 个 draft token；验证结果出来后，把未接受的部分从 <code>num_computed_tokens</code> 回退。其余步骤仍是同一个 <code>schedule → forward → sample → update</code> 闭环。</span></div>
 
   <div class="diagram-title">总体架构：跨步循环</div>
   <div class="diagram-box mermaid-container">
@@ -1134,6 +1468,9 @@ flowchart TD
   <div class="diagram-title">propose 阶段 — gpu_model_runner.py:4864</div>
   <div class="callout"><code>sample_tokens</code> 末尾闭包 <code>propose_draft_token_ids</code>（:4493）按 proposer 类型决定在 bookkeeping 前/后调：<strong>GPU-token 路径</strong>（EAGLE/draft/extract_hidden/ngram_gpu）在 <code>_bookkeeping_sync</code> <strong>之前</strong>调，吃 GPU <code>sampled_token_ids</code>，省一次 D2H；<strong>CPU-token 路径</strong>（ngram/suffix/medusa）在 bookkeeping <strong>之后</strong>调，吃 CPU list。model-based 的 draft forward 不在单独 runner，而在 proposer 内：<code>SpecDecodeBaseProposer.propose</code>（llm_base_proposer.py:443）跑 <code>self.model(...)</code>（首 pass :524，多步循环 :613-681）。</div>
 
+  <details class="deep-dive">
+    <summary>进阶：各 proposer 后端的差异与输入位置<span class="deep-dive-hint">理解闭环后再查</span></summary>
+    <div class="deep-dive-body">
   <div class="diagram-title">proposer 后端一览</div>
   <table class="data-table">
     <thead><tr><th>后端</th><th>类 (file:line)</th><th>类型</th><th>生成 draft 的方式</th></tr></thead>
@@ -1150,6 +1487,8 @@ flowchart TD
       <tr><td>custom_class</td><td>custom_class_proposer.py:12</td><td>用户定义</td><td>导入 speculative_config.model 指向的类</td></tr>
     </tbody>
   </table>
+    </div>
+  </details>
 
   <div class="diagram-title">verify：一次 forward 验证所有 draft</div>
   <div class="callout"><code>_prepare_inputs</code> 把 committed+draft gather 进 <code>input_ids</code>（:1948），构建 <code>SpecDecodeMetadata</code>（_calc_spec_decode_metadata :2750，字段：<code>draft_token_ids/num_draft_tokens/cu_num_draft_tokens/target_logits_indices/bonus_logits_indices/logits_indices</code>，metadata.py:9）。<code>_build_attention_metadata</code> 设 <code>max_query_len</code> 覆盖所有 draft 位置（:4273）；forward 后 <code>compute_logits(hidden[logits_indices])</code> 只算 <code>[last_committed, draft_1…K]</code> 这些位置（:4366）。</div>
@@ -1234,8 +1573,8 @@ sequenceDiagram
 
 <!-- ═══════ SUMMARY ═══════ -->
 <section class="section" id="summary">
-  <div class="section-label" style="color:var(--text-muted)">附录</div>
-  <div class="section-title">完整时序图与数据对象流转</div>
+  <div class="section-label" style="color:var(--text-muted)">Reference · Trace a detail</div>
+  <div class="section-title">回查：完整时序与数据对象流转</div>
 
   <div class="diagram-title">一次完整 step 的端到端时序</div>
   <div class="diagram-box mermaid-container">
@@ -1321,8 +1660,8 @@ sequenceDiagram
 
 <!-- ═══════ READING ORDER ═══════ -->
 <section class="section" id="reading">
-  <div class="section-label" style="color:var(--text-muted)">How to read it</div>
-  <div class="section-title">代码阅读顺序</div>
+  <div class="section-label" style="color:var(--text-muted)">Reference · Source code</div>
+  <div class="section-title">回查：源码阅读顺序</div>
 
   <ol class="read-list">
     <li><strong>busy loop 主干</strong>：<code>core.py:1259 run_busy_loop</code> → <code>:1269 _process_input_queue</code> → <code>:1300 _process_engine_step</code> → <code>:479 step</code>。建立三线程模型。</li>
@@ -1340,7 +1679,7 @@ sequenceDiagram
   <div class="callout"><strong>一条记忆线索</strong>：所有"特殊"机制（chunked prefill、prefix cache、spec decode、jump decoding）都不是独立分支，而是被 <code>num_tokens_with_spec</code> / <code>num_computed_tokens</code> 这套统一记账吸收进同一个 <code>schedule → allocate_slots → execute_model → sample → update_from_output</code> 循环。抓住这条主线和三个设计决策，其余都是分支。</div>
 
   <div class="file-ref" style="margin-top:32px">
-    核对基准：vLLM tag <span class="path">v0.24.0</span> (commit ee0da84ab) &nbsp;|&nbsp; 配套 markdown：<span class="path">learning_doc/execution-core.md</span> &nbsp;|&nbsp; 风格参考：<span class="path">vllm-request-journey.html</span>
+    核对基准：vLLM tag <span class="path">v0.25.1</span> (commit 752a3a504) &nbsp;|&nbsp; 配套 markdown：<span class="path">learning_doc/execution-core.md</span> &nbsp;|&nbsp; 风格参考：<span class="path">vllm-request-journey.html</span>
   </div>
 </section>
 
