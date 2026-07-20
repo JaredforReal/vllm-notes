@@ -5,10 +5,10 @@
 > model executor / 模型运行 → sampling → spec decode**——把调度、KV cache、forward、采样、推测解码
 > 的调用栈、数据对象和算法细节讲透。
 >
-> 核对基准：`vllm` 仓库 tag **`v0.25.1`**（commit `752a3a504`）。`file:line` 基于该版本核对，可直接点开
-> （3.3.14 例外——它标注了基于 `glm5_next` 本地工作树，因为其中的 mamba 均衡分组 + 多层组内存核算是
-> 尚未进入 v0.25.1 的本地改动）。默认路径 `VLLM_USE_V2_MODEL_RUNNER=0`
-> （走 `vllm/v1/worker/gpu_model_runner.py`）。
+> 核对基准：`vllm` 仓库 tag **`v0.25.1`**（commit `752a3a504`）。所有 `file:line` 均按该 tag 核对，
+> 可直接点开。本文聚焦运行时主循环；KV cache 的**加载期规划**（spec → 分组 → num_blocks → GPU tensor
+> → 清零）的完整展开在 [kvcache.md](./kvcache.md)，本文 3.3.14 / 3.3.15 只留结论与指针。
+> 默认路径 `VLLM_USE_V2_MODEL_RUNNER=0`（走 `vllm/v1/worker/gpu_model_runner.py`）。
 
 ## 0. 先跑通一次普通 decode（建议 5 分钟）
 
@@ -74,34 +74,35 @@ EngineCoreProc.run_busy_loop()            v1/engine/core.py:1259
   ├─ _process_input_queue()               core.py:1269   取 ADD/ABORT/UTILITY，idle 时阻塞
   └─ _process_engine_step()               core.py:1300
        └─ EngineCore.step()               core.py:479
-            ├─ Phase 1: Scheduler.schedule()              v1/core/sched/scheduler.py:388
-            │     └─ KVCacheManager.allocate_slots()      v1/core/kv_cache_manager.py:244
-            │           └─ BlockPool / Coordinator         v1/core/block_pool.py
+            ├─ Phase 1: Scheduler.schedule()              v1/core/sched/scheduler.py:396
+            │     └─ KVCacheManager.allocate_slots()      v1/core/kv_cache_manager.py:248
+            │           ├─ KVCacheCoordinator              v1/core/kv_cache_coordinator.py:61
+            │           └─ BlockPool                         v1/core/block_pool.py:144
             ├─ Phase 2: model_executor.execute_model(non_block=True)   core.py:491
-            │     └─ … → GPUModelRunner.execute_model()   v1/worker/gpu_model_runner.py:4056
+            │     └─ … → GPUModelRunner.execute_model()   v1/worker/gpu_model_runner.py:4070
             │           └─ model forward → logits 暂存到 execute_model_state，返回 None
-            ├─        Scheduler.get_grammar_bitmask()     scheduler.py:1440   ← 与 GPU forward 并行
+            ├─        Scheduler.get_grammar_bitmask()     scheduler.py:1475   ← 与 GPU forward 并行
             ├─        future.result()                     core.py:497
             ├─ Phase 3: model_executor.sample_tokens()    core.py:499
-            │     └─ GPUModelRunner.sample_tokens()       gpu_model_runner.py:4435
+            │     └─ GPUModelRunner.sample_tokens()       gpu_model_runner.py:4456
             │           ├─ apply_grammar_bitmask()        v1/structured_output/utils.py:85
             │           ├─ Sampler.forward()              v1/sample/sampler.py:72
-            │           ├─ _bookkeeping_sync()            gpu_model_runner.py:3613   ← 唯一 GPU→CPU 同步
-            │           └─ propose_draft_token_ids()      gpu_model_runner.py:4864   ← spec decode propose
-            └─ Phase 4: Scheduler.update_from_output()    scheduler.py:1464
+            │           ├─ _bookkeeping_sync()            gpu_model_runner.py:3627   ← 唯一 GPU→CPU 同步
+            │           └─ propose_draft_token_ids()      gpu_model_runner.py:4913   ← spec decode propose
+            └─ Phase 4: Scheduler.update_from_output()    scheduler.py:1499
                   └─ spec decode accept/reject + 回退 num_computed_tokens
 ```
 
 **三个关键设计决策**（后文反复出现，先记下来）：
 
 1. **execute_model 与 sample_tokens 被刻意拆成两次调用**：`execute_model()` 只做 forward 并把 logits 暂存
-   到 `self.execute_model_state`，返回 `None`（`gpu_model_runner.py:4417`）；`sample_tokens()` 再取出采样。
+   到 `self.execute_model_state`，返回 `None`（`gpu_model_runner.py:4438`）；`sample_tokens()` 再取出采样。
    这让 EngineCore 能在 GPU 跑 forward 的同时用 CPU 算 grammar bitmask（`core.py:491-492`）。
 2. **采样全程在 GPU 完成**，唯一的 GPU→CPU 同步是 `_bookkeeping_sync()` 把 `sampled_token_ids` 拷成
-   Python list（`gpu_model_runner.py:3613` / `_to_list` `:7504`）。top-k/top-p 用 FlashInfer 或
+   Python list（`gpu_model_runner.py:3627` / `_to_list` `:7504`）。top-k/top-p 用 FlashInfer 或
    Gumbel-max，刻意回避 `torch.multinomial`（会触发同步）。
 3. **spec decode 复用同一套 token 记账**：draft token 不是特殊路径，而是被计入
-   `num_tokens_with_spec = len(prompt) + len(output) + len(spec_token_ids)`（`scheduler.py:390-399`），
+   `num_tokens_with_spec = len(prompt) + len(output) + len(spec_token_ids)`（`scheduler.py:398-407`），
    于是 chunked prefill / prefix cache / spec decode / jump decoding 共用同一套调度逻辑。
 
 ---
@@ -188,7 +189,10 @@ _process_input_queue()
         _handle_client_request(*req)
 ```
 
-`has_work()` = scheduler 有未完成请求 **或** input_queue 非空。所以循环语义是：
+`has_work()`（`core.py:1249-1253`）= `engines_running or scheduler.has_requests() or bool(batch_queue)`
+——注意它**不含** input_queue：`has_work()` 为假时循环阻塞在 `input_queue.get(block=True)`，
+而 ADD 一旦被 `_handle_client_request` 交给 scheduler，`has_requests()` 即变真，循环语义不变
+（`engines_running` 是 DP 路径专用，单 DP 恒 False）。所以循环语义是：
 
 - **空闲时**：阻塞在 `input_queue.get(block=True)`，等第一个请求唤醒。
 - **被唤醒后**：`has_work()` 变真，跳出 while，进入 drain 循环把当前积压的输入全部处理掉，
@@ -206,8 +210,10 @@ _process_engine_step()
         time.sleep(0.001)                            ← 让出 GIL，给后台 KV 传输线程机会
 ```
 
-`step_fn` 在 `core.py:221-223` 绑定：`max_concurrent_batches > 1`（pipeline parallel）时绑
-`step_with_batch_queue`，否则绑 `step`。末尾的 `time.sleep(0.001)` 很关键：当本步没有真正跑模型
+`step_fn` 在 `core.py:221-223` 绑定：`max_concurrent_batches > 1` 时绑
+`step_with_batch_queue`，否则绑 `step`。`max_concurrent_batches`（`config/vllm.py:492-502`）
+在 PP>1 时等于 pp_size，**async scheduling 且 PP≤1 时也为 2**——batch queue 路径不是 PP 专属，
+纯异步调度也会走。末尾的 `time.sleep(0.001)` 很关键：当本步没有真正跑模型
 （例如 `WAITING_FOR_REMOTE_KV` 状态、或延迟 KV connector free），主动让出 GIL，避免空转饿死
 后台传输线程（`core.py:1311-1315` 注释）。
 
@@ -256,7 +262,7 @@ def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
 worker 产出的 draft token 拉回 scheduler（`take_draft_token_ids()` → `update_draft_token_ids()`）；
 异步路径下 draft token 直接在 worker 内更新，这里跳过（`core.py:514`）。
 
-`step_with_batch_queue()`（`core.py:519`）是 pipeline parallel 的变体：用 `batch_queue` 把
+`step_with_batch_queue()`（`core.py:519`）是 `max_concurrent_batches > 1`（PP 或异步调度）的变体：用 `batch_queue` 把
 多步的 `(future, scheduler_output, exec_future)` 排成流水线，允许 `execute_model` 和
 `sample_tokens` 都以 `non_block=True` 发出，实现 PP stage 间的重叠。结构同构，本文主线以 `step()` 为准。
 
@@ -305,7 +311,7 @@ worker 产出的 draft token 拉回 scheduler（`take_draft_token_ids()` → `up
 
 ## 3. 决定本轮工作：schedule 与 KV cache
 
-`Scheduler.schedule()`（`v1/core/sched/scheduler.py:388`）是每个 iteration 的起点。它不区分
+`Scheduler.schedule()`（`v1/core/sched/scheduler.py:396`）是每个 iteration 的起点。它不区分
 “prefill phase / decode phase”，而是用一个统一的 token 记账把 chunked prefill、prefix cache、
 spec decode 全部纳入。
 
@@ -318,7 +324,7 @@ spec decode 全部纳入。
 Scheduler (v1/core/sched/scheduler.py)
   ├── self.running : list[Request]      正在生成、每步都会被尝试调度
   ├── self.waiting : RequestQueue       新到 / 被抢占的请求，等准入
-  ├── self.kv_cache_manager : KVCacheManager     scheduler.py:254-268 构造
+  ├── self.kv_cache_manager : KVCacheManager     scheduler.py:262-276 构造
   ├── self.connector : KVConnector      外部 KV（P/D disagg、外部 KV store）
   ├── self.structured_output_manager     grammar 后端
   ├── self.max_num_scheduled_tokens      每步 token 预算（max_num_seqs × max_num_batched_tokens 相关）
@@ -333,53 +339,53 @@ Scheduler (v1/core/sched/scheduler.py)
 
 ### 3.2 schedule() 主流程
 
-**文件**: `vllm/v1/core/sched/scheduler.py:388`
+**文件**: `vllm/v1/core/sched/scheduler.py:396`
 
 ```
-schedule(throttle_prefills)                                            scheduler.py:388
+schedule(throttle_prefills)                                            scheduler.py:396
   │
   ├─ current_step += 1
   ├─ 初始化累积容器：scheduled_{new,resumed,running}_reqs / preempted_reqs
   │                 req_to_new_blocks / num_scheduled_tokens / token_budget
-  │                 scheduled_spec_decode_tokens / scheduled_encoder_inputs        :401-417
+  │                 scheduled_spec_decode_tokens / scheduled_encoder_inputs        :409-427
   │
-  ├─ kv_cache_manager.new_step_starts()                  :422   每步开始：清“本步缓存”标记
+  ├─ kv_cache_manager.new_step_starts()                  :432   每步开始：清“本步缓存”标记
   │
   ├─ defer_prefills = throttle_prefills and not prefill_capacity_bound
-  │                   and any(running 中有非 prefill_chunk)     :426-428   ← DP prefill 均衡
+  │                   and any(running 中有非 prefill_chunk)     :434-438   ← DP prefill 均衡
   │
-  ├─ 【Phase A】调度 RUNNING 请求（inline 循环）         :430-623
+  ├─ 【Phase A】调度 RUNNING 请求（inline 循环）         :440-624
   │    for request in self.running (req_index 遍历, token_budget>0):
-  │      ├─ 跳过：达到 max_tokens / 未到 next_decode_eligible_step / defer_prefills   :435-461
+  │      ├─ 跳过：达到 max_tokens / 未到 next_decode_eligible_step / defer_prefills   :445-471
   │      ├─ num_new_tokens = num_tokens_with_spec + num_output_placeholders
-  │      │                   - num_computed_tokens                  :463-467
-  │      │    ↑ 长预填充分块 (long_prefill_token_threshold)          :468-469
-  │      │    ↑ token_budget / max_model_len 截断                    :470-479
-  │      ├─ allocate_slots 重试 + 抢占循环（见 3.5）                :523-572
-  │      ├─ 记录 scheduled_running_reqs / req_to_new_blocks / num_scheduled_tokens  :574-580
-  │      └─ spec：把本轮要验证的 draft token 切出来                  :582-594
+  │      │                   - num_computed_tokens                  :473-477
+  │      │    ↑ 长预填充分块 (long_prefill_token_threshold)          :478-479
+  │      │    ↑ token_budget / max_model_len 截断                    :480-489
+  │      ├─ allocate_slots 重试 + 抢占循环（见 3.5）                :534-578
+  │      ├─ 记录 scheduled_running_reqs / req_to_new_blocks / num_scheduled_tokens  :584-591
+  │      └─ spec：把本轮要验证的 draft token 切出来                  :593-609
   │            num_scheduled_spec_tokens = num_new_tokens + num_computed_tokens
   │                                       - num_tokens - num_output_placeholders
-  │            scheduled_spec_decode_tokens[req_id] = spec_token_ids[:n]   :590-594
+  │            scheduled_spec_decode_tokens[req_id] = spec_token_ids[:n]   :601-605
   │
-  ├─ 【Phase B】调度 WAITING 请求（inline 循环）        :625-988
+  ├─ 【Phase B】调度 WAITING 请求（inline 循环）        :636-1020
   │    for request in self.waiting:
   │      ├─ prefix cache 命中：get_computed_blocks(request) → (new_computed_blocks,
-  │      │    num_new_local_computed_tokens)                          :667-712
-  │      │    （hybrid/Mamba/connector 走 find_longest_cache_hit_per_group :675-708）
-  │      ├─ connector 外部 token：connector.get_num_new_matched_tokens() :722-743
-  │      ├─ num_new_tokens（chunked prefill 切分、长 prefill 阈值）    :782-812
+  │      │    num_new_local_computed_tokens)                          :687-726
+  │      │    （hybrid/Mamba/connector 走 find_longest_cache_hit_per_group :689-722）
+  │      ├─ connector 外部 token：connector.get_num_new_matched_tokens() :736-757
+  │      ├─ num_new_tokens（chunked prefill 切分、长 prefill 阈值）    :805-843
   │      ├─ allocate_slots(全参数：new_computed_blocks, num_external_computed_tokens,
-  │      │    full_sequence_must_fit=scheduler_reserve_full_isl, reserved_blocks, ...)  :866-885
-  │      ├─ 失败 → free encoder inputs, break（停止准入）              :888-895
+  │      │    full_sequence_must_fit=scheduler_reserve_full_isl, reserved_blocks, ...)  :903-915
+  │      ├─ 失败 → free encoder inputs, break（停止准入）              :917-924
   │      └─ 成功 → running.append, status=RUNNING,
-  │            num_computed_tokens = num_computed_tokens              :939-960
+  │            num_computed_tokens = num_computed_tokens              :946-989
   │
   ├─ 【收尾】
-  │    ├─ get_num_common_prefix_blocks(any_req_id)    :1004-1010   ← cascade attention
-  │    ├─ take_new_block_ids()                        :1046-1050   ← 需要清零的新 block
-  │    ├─ num_spec_tokens_to_schedule（动态 SD 选 K） :1052-1057
-  │    └─ 构造 SchedulerOutput 并返回                 :1064-1075
+  │    ├─ get_num_common_prefix_blocks(any_req_id)    :1035-1043   ← cascade attention
+  │    ├─ take_new_block_ids()                        :1079-1083   ← 需要清零的新 block
+  │    ├─ num_spec_tokens_to_schedule（动态 SD 选 K） :1085-1090
+  │    └─ 构造 SchedulerOutput 并返回                 :1092-1109
   │
   └─ return SchedulerOutput
 ```
@@ -388,7 +394,7 @@ schedule(throttle_prefills)                                            scheduler
 优先保证在跑的请求不 stall；新请求的 prefill 占内存大，放到后面，剩余 token 预算和 KV 空间不足时
 自然被推迟。
 
-**统一记账的力量**（`scheduler.py:390-399` 注释）：
+**统一记账的力量**（`scheduler.py:398-407` 注释）：
 
 ```
 num_tokens_with_spec = len(prompt) + len(output) + len(spec_token_ids)
@@ -408,29 +414,30 @@ num_new_tokens       = num_tokens_with_spec + num_output_placeholders - num_comp
 
 ```
 Scheduler
-  └─ KVCacheManager                  v1/core/kv_cache_manager.py:110      对 scheduler 的门面
+  └─ KVCacheManager                  v1/core/kv_cache_manager.py:114      对 scheduler 的门面
        └─ KVCacheCoordinator          v1/core/kv_cache_coordinator.py:61   抽象基类，3 个具体子类
-            │   ├─ NoPrefixCache      kv_cache_coordinator.py:369   关闭缓存 / 0 group
-            │   ├─ Unitary            kv_cache_coordinator.py:419   单 group
-            │   └─ Hybrid             kv_cache_coordinator.py:506   多 group，定点迭代找最长命中
+            │   ├─ NoPrefixCache      kv_cache_coordinator.py:377   关闭缓存 / 0 group
+            │   ├─ Unitary            kv_cache_coordinator.py:427   单 group
+            │   └─ Hybrid             kv_cache_coordinator.py:514   多 group，定点迭代找最长命中
             ├─ BlockPool              v1/core/block_pool.py:144      空闲链表 + prefix hash 表
             └─ tuple[SingleTypeKVCacheManager ...]
-                  ├─ FullAttentionManager        single_type_kv_cache_manager.py:540
-                  ├─ SlidingWindowManager        :601
-                  ├─ ChunkedLocalAttentionManager :808
-                  ├─ MambaManager                :958
-                  ├─ CrossAttentionManager       :1293
-                  └─ SinkFullAttentionManager    :1356
+                  ├─ FullAttentionManager        single_type_kv_cache_manager.py:564
+                  ├─ RSWAManager                 :625
+                  ├─ SlidingWindowManager        :669
+                  ├─ ChunkedLocalAttentionManager :876
+                  ├─ MambaManager                :1026
+                  ├─ CrossAttentionManager       :1368
+                  └─ SinkFullAttentionManager    :1431
 ```
 
 `KVCacheManager` 自己几乎不存逻辑——它存 `kv_cache_config`、`coordinator`、`block_pool`、
-`watermark_blocks`（`kv_cache_manager.py:127-179`），把活全转发给 `coordinator`。**没有**
+`watermark_blocks`（`kv_cache_manager.py:115-183`），把活全转发给 `coordinator`。**没有**
 `UnifiedKVCacheManager`（“unified”是 spec 层概念 `UniformTypeKVCacheSpecs`）；**也没有**
 `num_blocks_per_alloc` 字段——分配粒度恒为 1 个 block，需要几个由 `ceil(num_tokens/block_size)` 决定。
 
 #### 3.3.1 allocate_slots 十步算法
 
-**文件**: `vllm/v1/core/kv_cache_manager.py:244`
+**文件**: `vllm/v1/core/kv_cache_manager.py:248`
 
 scheduler 对每个请求调一次 `allocate_slots`，决定“给多少 block、能不能放下”。算法（行号在
 `kv_cache_manager.py` 内）：
@@ -442,51 +449,51 @@ allocate_slots(request, num_new_tokens, num_new_computed_tokens=0,
                num_encoder_tokens=0, full_sequence_must_fit=False,
                reserved_blocks=0, has_scheduled_reqs=True)
   │
-  ├─ ① 算 token 总数                                    :355-361
+  ├─ ① 算 token 总数                                    :357-365
   │     num_local_computed  = request.num_computed_tokens + num_new_computed_tokens
   │     total_computed      = min(num_local_computed + num_external, max_model_len)
   │
-  ├─ ② watermark 门槛                                   :363-370
+  ├─ ② watermark 门槛                                   :367-374
   │     仅对 WAITING/PREEMPTED 且已有请求在跑时施加 watermark_blocks
   │     （RUNNING 不吃 watermark，避免 decode 被 watermark 卡住）
   │
-  ├─ ③ full_sequence_must_fit 准入检查（WAITING）       :372-387
+  ├─ ③ full_sequence_must_fit 准入检查（WAITING）       :376-391
   │     n = coordinator.get_num_blocks_to_allocate(..., apply_admission_cap=True)
   │     if n + watermark_blocks > block_pool.get_num_free_blocks(): return None
   │
-  ├─ ④ 先回收 sliding-window / Mamba 的 skipped block    :400-402
+  ├─ ④ 先回收 sliding-window / Mamba 的 skipped block    :404-408
   │     coordinator.remove_skipped_blocks(...)
   │
-  ├─ ⑤ 重新算本步真实需要的 block 数                     :404-412
+  ├─ ⑤ 重新算本步真实需要的 block 数                     :410-418
   │     num_blocks_to_allocate = coordinator.get_num_blocks_to_allocate(...)
   │
-  ├─ ⑥ 空闲容量检查                                     :416-420
+  ├─ ⑥ 空闲容量检查                                     :420-426
   │     available = get_num_free_blocks() - reserved_blocks
   │     if num_blocks_to_allocate + watermark_blocks > available: return None
   │
-  ├─ ⑦ 挂上 prefix 命中的 block（touch，拉出空闲链表）  :422-433
+  ├─ ⑦ 挂上 prefix 命中的 block（touch，拉出空闲链表）  :428-439
   │     coordinator.allocate_new_computed_blocks(...)
   │       └─ manager.add_local_computed_blocks → block_pool.touch()  ref_cnt++
   │
-  ├─ ⑧ 分配全新 block                                   :435-440
+  ├─ ⑧ 分配全新 block                                   :441-446
   │     coordinator.allocate_new_blocks(request_id, num_tokens_need_slot, ...)
   │       └─ manager.allocate_new_blocks → block_pool.get_new_blocks(n)
   │
-  ├─ ⑨ 把写满的 block 入 prefix hash 表                 :444-456
+  ├─ ⑨ 把写满的 block 入 prefix hash 表                 :448-462
   │     num_tokens_to_cache = min(total_computed + num_new_tokens, request.num_tokens)
   │     ↑ 截断到 num_tokens：未验证的 draft token 不缓存
   │     coordinator.cache_blocks(request, num_tokens_to_cache)  (除非 delay_cache_blocks)
   │
-  └─ ⑩ return create_kv_cache_blocks(new_blocks)        :458
+  └─ ⑩ return create_kv_cache_blocks(new_blocks)        :464
 ```
 
 **block 数量怎么算**（`SingleTypeKVCacheManager.get_num_blocks_to_allocate`，
-`single_type_kv_cache_manager.py:101`）：
+`single_type_kv_cache_manager.py:102`）：
 
 ```
-num_required_blocks = cdiv(num_tokens, block_size)          :132   ← ceil(num_tokens / block_size)
+num_required_blocks = cdiv(num_tokens, block_size)          :133   ← ceil(num_tokens / block_size)
 # running 请求（已 cached 过）的快速路径：
-num_new = max(num_required_blocks - num_req_blocks, 0)      :154   ← 处理 draft 回滚后 block 不增
+num_new = max(num_required_blocks - num_req_blocks, 0)      :155   ← 处理 draft 回滚后 block 不增
 # 新请求：减去已覆盖的 computed/skipped，再加回 evictable（ref_cnt==0 但还在命中表里的）
 ```
 
@@ -508,7 +515,9 @@ hash = hash_function( (parent_block_hash, curr_block_token_ids_tuple, extra_keys
 - `extra_keys`（`generate_block_hash_extra_keys`，`:539`）包含：多模态 feature 的
   `(identifier, offset)`（`:431`）、LoRA 名（`:498`）、`cache_salt`（仅第一个 block，`:560`）、
   prompt embeds 的 sha256（`:513`）。
-- hash 与 group id 组合成 `BlockHashWithGroupId`（`:57`），保证同样内容在不同 KV cache group 里是不同 key。
+- hash 与 group id 组合成 `BlockHashWithGroupId`（packed bytes：类型定义 `:46-49`，打包函数
+  `make_block_hash_with_group_id` `:57-66`，group_id 以 4 字节大端追加在 hash 后），
+  保证同样内容在不同 KV cache group 里是不同 key。
 
 每请求的 block hash 列表由 `get_request_block_hasher`（`:673`）按 `hash_block_size` 对齐窗口生成，
 只哈希**写满**的 block（`:709`）。
@@ -517,26 +526,26 @@ hash = hash_function( (parent_block_hash, curr_block_token_ids_tuple, extra_keys
 单 block 直接存 `KVCacheBlock`；同 hash 不同 block_id 的碰撞升级成 `dict[int, KVCacheBlock]`。
 **不做去重**——block 写满入表时不查重，block table 是 append-only（`block_pool.py:48-52` 注释）。
 
-**命中查找**（`KVCacheManager.get_computed_blocks`，`kv_cache_manager.py:202`）：
+**命中查找**（`KVCacheManager.get_computed_blocks`，`kv_cache_manager.py:206`）：
 
 ```
 get_computed_blocks(request)
-  ├─ if not enable_caching or request.skip_reading_prefix_cache: return (empty, 0)   :218-219
-  ├─ max_cache_hit_length = request.num_tokens - 1   :227
+  ├─ if not enable_caching or request.skip_reading_prefix_cache: return (empty, 0)   :222-223
+  ├─ max_cache_hit_length = request.num_tokens - 1   :231
   │     ↑ 整个 prompt 都命中时，最后一个 token 必须重算（要 logits）；且 num_computed 需 block 对齐
-  ├─ computed = coordinator.find_longest_cache_hit(request.block_hashes, max_cache_hit_length)  :228
+  ├─ computed = coordinator.find_longest_cache_hit(request.block_hashes, max_cache_hit_length)  :232-236
   └─ return (create_kv_cache_blocks(computed), num_new_computed_tokens)
 ```
 
 `find_longest_cache_hit` 三种实现（`kv_cache_coordinator.py`）：
-- `FullAttentionManager`（`single_type_kv_cache_manager.py:541`）：从左到右扫 `block_hashes`，逐个
+- `FullAttentionManager`（`single_type_kv_cache_manager.py:566`）：从左到右扫 `block_hashes`，逐个
   `block_pool.get_cached_block()`，命中就 append，**第一个 miss 就 break**——这就是“最长前缀命中”。
-- `SlidingWindowManager`（`:619`）：从右往左，要求滑动窗口内有连续命中。
-- `HybridKVCacheCoordinator`（`:622`）：**定点迭代**——每种 attention 类型要么接受当前候选长度、要么
+- `SlidingWindowManager`（`:688`）：从右往左，要求滑动窗口内有连续命中。
+- `HybridKVCacheCoordinator`（`:630`）：**定点迭代**——每种 attention 类型要么接受当前候选长度、要么
   缩短它，反复迭代到稳定；full attention 最先处理且向下封闭。
 
 **命中如何免重算**：命中的 block 经 `allocate_slots` ⑦步 `touch`（`ref_cnt++`，移出空闲链表）挂回请求。
-因为它们已写满且已哈希，scheduler 把它们的 token 计入 `num_computed_tokens`（`scheduler.py:960`），
+因为它们已写满且已哈希，scheduler 把它们的 token 计入 `num_computed_tokens`（`scheduler.py:989`），
 model runner 直接跳过不重算。
 
 **写满入表**（`BlockPool.cache_full_blocks`，`block_pool.py:226`）：遍历
@@ -549,12 +558,12 @@ model runner 直接跳过不重算。
 - **淘汰是隐式的**：`get_new_blocks` 弹出一个还带 hash 的 block 时，`_maybe_evict_cached_block`
   （`:574`）把它的所有 hash key 从表里 `pop` 掉、`reset_hash()`。所以“淘汰”= 把可淘汰的缓存 block
   复用给新内容。
-- 链表顺序不变量（`kv_cache_utils.py:186-195`）：LRU 在前；同优先级时**链尾先淘汰**（靠释放时逆序 free 实现）。
+- 链表顺序不变量（`kv_cache_utils.py:188-195`）：LRU 在前；同优先级时**链尾先淘汰**（靠释放时逆序 free 实现）。
 
 #### 3.3.3 free / 回收：ref_cnt 决定去留
 
-**`KVCacheManager.free`**（`kv_cache_manager.py:460`）→ `coordinator.free`（`kv_cache_coordinator.py:285`）
-→ 每个 `manager.free`（`single_type_kv_cache_manager.py:401`）→ `block_pool.free_blocks(reversed(...))`
+**`KVCacheManager.free`**（`kv_cache_manager.py:466`）→ `coordinator.free`（`kv_cache_coordinator.py:285`）
+→ 每个 `manager.free`（`single_type_kv_cache_manager.py:402`）→ `block_pool.free_blocks(reversed(...))`
 （**逆序** free，让链尾先回空闲，符合 LRU tie-breaking）。
 
 **`BlockPool.free_blocks`**（`block_pool.py:614`）——核心：
@@ -580,8 +589,8 @@ free_block_queue.append_n(blocks_with_hash)       ← 放到淘汰靠后，但�
 v1 **没有** `can_fit`/`can_allocate`/MAYBE-NO-YES 枚举。准入就是 `allocate_slots` 的返回值约定：
 
 - 返回 `KVCacheBlocks` → 放得下，调度。
-- 返回 `None` → 放不下；RUNNING 路径触发抢占（`scheduler.py:570-572`），WAITING 路径停止准入
-  （`scheduler.py:888-895`）。
+- 返回 `None` → 放不下；RUNNING 路径触发抢占（`scheduler.py:580-582`），WAITING 路径停止准入
+  （`scheduler.py:917-924`）。
 
 两个数值门槛在 `allocate_slots` 内（③ 和 ⑥），都是 `required_blocks > available_blocks → None`。
 
@@ -591,80 +600,82 @@ v1 **没有** `can_fit`/`can_allocate`/MAYBE-NO-YES 枚举。准入就是 `alloc
 **recompute**：释放该请求全部 block，`num_computed_tokens` 归零，回 waiting 队列头，重跑时靠幸存的
 prefix 命中省一部分。
 
-抢占触发在 RUNNING 路径的 `allocate_slots` 重试循环（`scheduler.py:523-572`）：
+抢占触发在 RUNNING 路径的 `allocate_slots` 重试循环（`scheduler.py:534-578`）：
 
 ```
 while True:
-    new_blocks = kv_cache_manager.allocate_slots(request, num_new_tokens, ...)   :525
-    if new_blocks is not None: break              :531   放得下
+    new_blocks = kv_cache_manager.allocate_slots(request, num_new_tokens, ...)   :535
+    if new_blocks is not None: break              :541-543   放得下
     # 放不下 → 抢占一个低优先级请求
     if policy == PRIORITY:
-        preempted_req = max(self.running, key=lambda r: (r.priority, r.arrival_time))   :537-541
+        preempted_req = max(self.running, key=lambda r: (r.priority, r.arrival_time))   :548-552
         self.running.remove(preempted_req)
-        # 若它本步已调度，回滚本步给它分配的预算/block/spec/encoder                        :543-560
+        # 若它本步已调度，回滚本步给它分配的预算/block/spec/encoder                        :553-570
     else:
-        preempted_req = self.running.pop()        :562   FCFS：抢最新的
-    self._preempt_request(preempted_req, scheduled_timestamp)                          :564
-    if preempted_req == request: break            :566   抢到自己了，没得抢
-if new_blocks is None: break                      :570   放不下就跳出 RUNNING 循环
+        preempted_req = self.running.pop()        :572   FCFS：抢最新的
+    self._preempt_request(preempted_req, scheduled_timestamp)                          :574
+    if preempted_req == request: break            :576-578   抢到自己了，没得抢
+if new_blocks is None: break                      :580-582   放不下就跳出 RUNNING 循环
 ```
 
-**`_preempt_request`**（`scheduler.py:1107`）：
+**`_preempt_request`**（`scheduler.py:1140`）：
 
 ```
 _preempt_request(request, scheduled_timestamp)
   ├─ assert request.status == RUNNING
-  ├─ _free_request_blocks(request)        ← kv_cache_manager.free()（或延迟 free）  scheduler.py:1116
-  ├─ encoder_cache_manager.free(request)                                                   :1117
-  ├─ _inflight_prefills.discard(request)                                                   :1118
-  ├─ request.status = PREEMPTED                                                            :1119
-  ├─ request.num_computed_tokens = 0       ← 关键：recompute，进度清零                  :1120
-  ├─ request.spec_token_ids = []                                                            :1121
-  ├─ request.num_preemptions += 1                                                          :1123
-  └─ self.waiting.prepend_request(request)  ← 回 waiting 队列头                          :1128
+  ├─ _free_request_blocks(request)        ← kv_cache_manager.free()（或延迟 free）  scheduler.py:1149
+  ├─ encoder_cache_manager.free(request)                                                   :1150
+  ├─ _inflight_prefills.discard(request)                                                   :1151
+  ├─ request.status = PREEMPTED                                                            :1152
+  ├─ request.num_computed_tokens = 0       ← 关键：recompute，进度清零                  :1153
+  ├─ request.spec_token_ids = []  （有 `if request.spec_token_ids:` 守卫）                  :1154-1155
+  ├─ request.num_preemptions += 1                                                          :1156
+  └─ self.waiting.prepend_request(request)  ← 回 waiting 队列头                          :1161
 ```
 
-延迟 free（`defer_block_free`，PP/async 配置）走 `_free_request_blocks`（`scheduler.py:2082`）：
+延迟 free（`defer_block_free`，PP/async 配置）走 `_free_request_blocks`（`scheduler.py:2130`）：
 若该请求还有在飞 GPU 写未完成（`last_sched_seq > processed_step_seq`），只 `pop_blocks_for_free`
 把 block 摘下、暂存 `deferred_frees`，等 `update_from_output` 里 `processed_step_seq` 追上后由
-`_drain_deferred_frees`（`scheduler.py:2097`）真正还回 pool——避免释放还在被 GPU 写的 block。
+`_drain_deferred_frees`（`scheduler.py:2145`）真正还回 pool——避免释放还在被 GPU 写的 block。
 
 #### 3.3.6 进阶：KV cache 的种类全景：Spec → Manager
 
 前面讲的 `allocate_slots` / prefix cache / 抢占都是**机制**，跟"缓存里到底存什么"无关。vLLM 用
 **`KVCacheSpec`（每层一份）**描述"这一层缓存什么、一个 block 多大"，用 **`SingleTypeKVCacheManager`**
 描述"这类缓存怎么分配/命中/释放"。spec 决定**内容与尺寸**，manager 决定**调度行为**，两者通过注册表
-绑定（`single_type_kv_cache_manager.py:1380-1415` `get_manager_for_kv_cache_spec`）。
+绑定（`single_type_kv_cache_manager.py:1455-1496` `get_manager_for_kv_cache_spec`）。
 
 spec 层级（`vllm/v1/kv_cache_interface.py`）：
 
 ```
-KVCacheSpec (:96)                           # block_size = 每 block 的 token 数
-├── AttentionSpec (:160)                    # num_kv_heads, head_size, dtype
-│   ├── FullAttentionSpec (:205)            # 基本全注意力；hybrid 关闭时 SWA 也归此
-│   │   ├── TQFullAttentionSpec (:341)      # 三值量化
-│   │   ├── MLAAttentionSpec (:367)         # ★ MLA（latent 压缩）
+KVCacheSpec (:100)                          # block_size = 每 block 的 token 数
+├── AttentionSpec (:164)                    # num_kv_heads, head_size, dtype
+│   ├── FullAttentionSpec (:206)            # 基本全注意力；hybrid 关闭时 SWA 也归此
+│   │   ├── TQFullAttentionSpec (:337)      # 三值量化
+│   │   ├── MLAAttentionSpec (:363)         # ★ MLA（latent 压缩）
 │   │   │   └── HiddenStateCacheSpec (:434)
-│   │   └── SinkFullAttentionSpec (:690)    # 带 sink block 的全注意力
-│   ├── ChunkedLocalAttentionSpec (:441)    # 分块局部注意力
-│   ├── SlidingWindowSpec (:478)            # 滑动窗口
-│   │   └── SlidingWindowMLASpec (:550)     # ★ 滑动窗口 + MLA 缓存格式
-│   ├── EncoderOnlyAttentionSpec (:670)     # 不需要 KV cache
-│   └── CrossAttentionSpec (:677)           # 交叉注意力（encoder-decoder）
-└── MambaSpec (:629)                        # ★ 状态缓存（Mamba1/2/Linear/GDN/ShortConv）
+│   │   └── SinkFullAttentionSpec (:730)    # 带 sink block 的全注意力
+│   ├── RSWASpec (:441)                     # Reference SWA：prefill 全程可见 + 只留最近窗口
+│   ├── ChunkedLocalAttentionSpec (:481)    # 分块局部注意力
+│   ├── SlidingWindowSpec (:518)            # 滑动窗口
+│   │   └── SlidingWindowMLASpec (:590)     # ★ 滑动窗口 + MLA 缓存格式
+│   ├── EncoderOnlyAttentionSpec (:710)     # 不需要 KV cache
+│   └── CrossAttentionSpec (:717)           # 交叉注意力（encoder-decoder）
+└── MambaSpec (:669)                        # ★ 状态缓存（Mamba1/2/Linear/GDN/ShortConv）
 ```
 
-spec → manager 绑定（注册在 `single_type_kv_cache_manager.py:1420-1467`）：
+spec → manager 绑定（`register_all_kvcache_specs`，`single_type_kv_cache_manager.py:1499-1559`）：
 
 | spec | manager | 缓存内容 | 随序列增长 |
 |------|---------|----------|------------|
-| `FullAttentionSpec` | `FullAttentionManager` (:540) | 每 token 的 K 和 V | O(seq_len) |
+| `FullAttentionSpec` | `FullAttentionManager` (:564) | 每 token 的 K 和 V | O(seq_len) |
 | `MLAAttentionSpec` | `FullAttentionManager` | latent `kv_c`+`k_pe`（无 V） | O(seq_len)，~128× 小 |
-| `SlidingWindowSpec` | `SlidingWindowManager` (:601) | K/V，窗口外回收 | O(window) 真实保留 |
+| `RSWASpec` | `RSWAManager` (:625) | K/V，prefill 全程可见 + 只留最近 `rswa_window` 个 decode token | O(prefix + window) |
+| `SlidingWindowSpec` | `SlidingWindowManager` (:669) | K/V，窗口外回收 | O(window) 真实保留 |
 | `SlidingWindowMLASpec` | `SlidingWindowManager` | MLA latent + 滑窗 | O(window)，latent 尺寸 |
-| `ChunkedLocalAttentionSpec` | `ChunkedLocalAttentionManager` (:808) | K/V，分块局部 | O(chunk) 真实保留 |
-| `MambaSpec` | `MambaManager` (:958) | 固定 state（conv+ssm） | O(1)/request |
-| `CrossAttentionSpec` | `CrossAttentionManager` (:1293) | encoder K/V | O(encoder_len) |
+| `ChunkedLocalAttentionSpec` | `ChunkedLocalAttentionManager` (:876) | K/V，分块局部 | O(chunk) 真实保留 |
+| `MambaSpec` | `MambaManager` (:1026) | 固定 state（conv+ssm） | O(1)/request |
+| `CrossAttentionSpec` | `CrossAttentionManager` (:1368) | encoder K/V | O(encoder_len) |
 | `EncoderOnlyAttentionSpec` | — | 无 | 0 |
 
 **关键**：MLA 用 `FullAttentionManager`（没有专门的 MLA manager）——因为分配机制相同
@@ -674,7 +685,7 @@ per-token，分配语义不同。
 
 #### 3.3.7 基本情况：Full Attention（per-token K/V）
 
-每一层一个 KV 张量，shape（flash-attn 后端，`v1/attention/backends/flash_attn.py:149`）：
+每一层一个 KV 张量，shape（flash-attn 后端，`v1/attention/backends/flash_attn.py:132`）：
 
 ```
 (num_blocks, 2, block_size, num_kv_heads, head_size)
@@ -682,14 +693,14 @@ per-token，分配语义不同。
   物理block数  K和V  slot数=token数  KV头数      每头维度
 ```
 
-- **`block_size` = slot 数 = 每 block 的 token 数**（默认 16，须为 16 倍数，`flash_attn.py:147-148`）。
+- **`block_size` = slot 数 = 每 block 的 token 数**（默认 16，须为 16 倍数，`flash_attn.py:130-131`）。
 - 那个 **`2` 是 K 和 V 拼出的维度**；等价地，一个 block（一层）的内存 =
   `block_size × num_kv_heads × (head_size + head_size_v) × dtype`
-  （`FullAttentionSpec.real_page_size_bytes`，`kv_cache_interface.py:323-328`，`head_size_v` 默认 = `head_size`）。
+  （`FullAttentionSpec.real_page_size_bytes`，`kv_cache_interface.py:310-324`，`head_size_v` 默认 = `head_size`）。
 - **block_table 跨层共享**：一个请求的 block_table = `[物理block_id_0, …]` 一维列表，对所有层都用
   同一个。token 在位置 p、第 L 层的 K/V 寻址 =
   `kv_cache[L][ block_table[p//block_size] ][p%block_size]`。
-- 内存 **O(seq_len)**：`max_memory_usage_bytes = cdiv(max_model_len, block_size) × page_size_bytes`（`:236-244`）。
+- 内存 **O(seq_len)**：`max_memory_usage_bytes = cdiv(max_model_len, block_size) × page_size_bytes`（`:237-246`）。
 
 > 一个 token 一次 forward 会为**每一层**都产生一对 K/V——这并不矛盾：层是张量的独立维度（每层一份
 > 张量），slot 只承担"位置"语义。block_table 是它在 block 这一维的 1D 投影，跨层复用。所以
@@ -703,11 +714,11 @@ MLA 不缓存完整 K/V，而是缓存一个**低秩 latent 向量**：
   key，dim `qk_rope_head_dim`=64）= **576 元素/token**（DSv3）。
 - **V 根本不缓存**——attention 时用 `kv_b_proj` 上投影从 latent 重建 V。
 - cache tensor shape = `(num_blocks, block_size, head_size=576)`，`num_kv_heads=1`
-  （`mla_attention.py:1216-1223`；`get_kv_cache_spec` 在 `:1004-1010` 传 `num_kv_heads=1`）。
+  （`layers/attention/mla_attention.py:1216-1223`；`get_kv_cache_spec` 在 `:1004-1010` 传 `num_kv_heads=1`）。
 - `real_page_size_bytes = storage_block_size × num_kv_heads(=1) × head_size × dtype`——**没有那个 `2`**
   （`kv_cache_interface.py:393-398`），因为只存 latent 不存 V。
-- 写入：`concat_and_cache_mla(kv_c_normed, k_pe, kv_cache, slot_mapping, ...)`
-  （`v1/attention/backend.py:963-983`，C++ op `_custom_ops.py:2620-2630`）。
+- 写入：v1 走 `unified_mla_kv_cache_update`（`layers/attention/mla_attention.py:1037`，
+  `torch.ops` 调用 `:606`，C++ wrapper `_custom_ops.py:2532-2543`）。
 
 **省多少**：DSv3 标准注意力本要存 `128 头 × (128+64) 的 K + 128×128 的 V`；MLA 只存一个 576 维
 latent，约 **~128× 缩减**（per token）。
@@ -719,7 +730,7 @@ latent，约 **~128× 缩减**（per token）。
   attention 输出后再用 `W_UV` 投回 V 维（`_v_up_proj`，`:1012-1034`）。decode **不展开 latent 成完整
   K/V**，省显存省带宽。
 - **prefill** 走 `forward_mha`（展开路径）：`kv_b_proj(kv_c_normed)` 展开成完整 K/V 跑标准 MHA
-  （`:2317-2321`）——prefill 算力富裕，展开换 kernel 效率。
+  （`forward_mha` `:2344`，`kv_b_proj` 展开调用 `:2371`）——prefill 算力富裕，展开换 kernel 效率。
 - 吸收权重在 `process_weights_after_loading` 预备：`kv_b_proj` 拆成 `W_UK`/`W_UV` 并转置
   （`:899-962`）。
 
@@ -730,23 +741,23 @@ latent，约 **~128× 缩减**（per token）。
 
 "稀疏 MLA"在 vLLM 里有两类：
 
-**① SlidingWindowMLASpec（窗口稀疏 + MLA 缓存）** —— `kv_cache_interface.py:550`，docstring
+**① SlidingWindowMLASpec（窗口稀疏 + MLA 缓存）** —— `kv_cache_interface.py:590`，docstring
 "Sliding window attention with MLA cache format"。一层同时是滑动窗口注意力 + 用 MLA latent 格式
 存缓存。窗口外的 block 经 `remove_skipped_blocks` 回收（`SlidingWindowManager`）。→ `SlidingWindowManager`。
 
 **② Top-k 选择稀疏 MLA（DeepSeek V3.2 / V4 的 `index_topk`）** —— 这才是社区常说的 "sparse MLA"：
 
 - 一个**独立的轻量 indexer 注意力**先算每个 query token 对**所有已缓存 token** 的相关度，选
-  top-`index_topk`（通常 2048）个 token 位置（`vllm/model_executor/models/deepseek_v2.py:603-674` 的
+  top-`index_topk`（通常 2048）个 token 位置（`vllm/model_executor/models/deepseek_v2.py:644-820` 的
   `Indexer`；top-k kernel 在 `vllm/model_executor/layers/sparse_attn_indexer.py` + `csrc/libtorch_stable/topk.cu`）。
 - 主 MLA attention **只对这 top-k 个 token** 做注意力，而不是全序列。
 - **缓存内容不变**——还是同一个 MLA latent 张量；只是 kernel 用 top-k 的 block table 去 gather 那
   2048 个 latent，而非全序列（`v1/attention/backends/mla/*_sparse.py`：`flashmla_sparse.py`、
   `flashinfer_mla_sparse.py`、`xpu_mla_sparse.py`、`rocm_aiter_mla_sparse.py`，`is_sparse()=True`，
-  只有 `forward_mqa` 没有 `forward_mha`，`backend.py:986-1041`）。
+  `SparseMLAAttentionImpl` 只有 `forward_mqa`（`:1079`）没有 `forward_mha`，`backend.py:1032-1111`）。
 - FP8 打包布局：DSv3.2 用 656 字节/token（512 fp8 NoPE + 16 scale + 128 bf16 RoPE），DSv4 用 584
   字节/token（`flashmla_sparse.py:65-87,132-144`）。
-- **启用条件**：模型 config 带 `index_topk` 即 DeepSeek V3.2（`deepseek_v2.py:1243-1253` 自动探测
+- **启用条件**：模型 config 带 `index_topk` 即 DeepSeek V3.2（`deepseek_v2.py:1076` 自动探测
   `is_v32 = hasattr(config, "index_topk")`）；V4 用 `model_version="deepseek_v4"`。普通
   DeepSeek-V2/V3（无 `index_topk`）走 dense MLA。没有独立 `--sparse-mla` 开关。
 
@@ -761,15 +772,15 @@ latent，约 **~128× 缩减**（per token）。
 - 一个 Mamba 层的 state = `conv_state`（卷积暂存）+ `ssm_state`/`temporal_state`（递归状态），shape
   与序列长度无关（`vllm/model_executor/layers/mamba/mamba_utils.py:162-187`，如 Mamba2
   `temporal_state=(num_heads/tp, head_dim, state_size)`，例 `(128,64,128)`）。
-- `MambaSpec`（`kv_cache_interface.py:629`）：`shapes`（各 state 的 shape）、`dtypes`、`mamba_type`
-  （`MAMBA1/MAMBA2/SHORT_CONV/LINEAR/GDN_ATTN`，`v1/attention/backends/registry.py:167-171`）、
+- `MambaSpec`（`kv_cache_interface.py:669`）：`shapes`（各 state 的 shape）、`dtypes`、`mamba_type`
+  （`MAMBA1/MAMBA2/SHORT_CONV/LINEAR/GDN_ATTN`，`v1/attention/backends/registry.py:166-180`）、
   `mamba_cache_mode`。
 - **一个 block = 一份完整 state 快照**（不是 block_size 个 token 的 K/V）：
-  `page_size_bytes = Σ prod(shape)×dtype_size`（`:638-646`）。
+  `page_size_bytes = Σ prod(shape)×dtype_size`（`:678-686`，有 `page_size_padded` 时返回 padded 值）。
 - **线性注意力（`linear_attn.py`）和 GDN（`gdn_attn.py`）复用 `MambaSpec`/`MambaManager`**，靠
   `mamba_type` 区分（线性注意力只有 recurrent_state 无 conv_state，`mamba_utils.py:130-137`）。
 
-**`mamba_cache_mode`**（`vllm/model_executor/models/config.py:417-456` 决定）决定状态怎么进 block 体系：
+**`mamba_cache_mode`**（`vllm/model_executor/models/config.py:547-606` 决定）决定状态怎么进 block 体系：
 
 | 模式 | 每 request block 数 | 含义 | prefix cache |
 |------|---------------------|------|--------------|
@@ -846,13 +857,13 @@ full + chunked-local）。这些层的 KV cache 由 `HybridKVCacheCoordinator`�
 | `SingleTypeKVCacheManager` | **每组**一个 | 跟踪"这组里每个请求持有哪些 block、哪些已缓存"，实现命中/分配/释放 | `single_type_kv_cache_manager.py:32` |
 | `FullAttentionManager` | 上面这个的具体实现 | 全注意力的命中（左→右最长前缀）与分配 | `:540` |
 | `KVCacheCoordinator` | **策略**对象 | 拥有 `BlockPool` + 一组 manager；跨组协调命中（定点迭代）和分配（fan-out） | `kv_cache_coordinator.py:61` |
-| `KVCacheManager` | scheduler 的**唯一接口** | 门面，几乎不存逻辑，全转发给 coordinator | `kv_cache_manager.py:110` |
+| `KVCacheManager` | scheduler 的**唯一接口** | 门面，几乎不存逻辑，全转发给 coordinator | `kv_cache_manager.py:114` |
 
 **所有权 / 委托链**
 
 ```
 Scheduler
-  └─ KVCacheManager (门面)                       kv_cache_manager.py:110
+  └─ KVCacheManager (门面)                       kv_cache_manager.py:114
        └─ KVCacheCoordinator (策略)              kv_cache_coordinator.py:61
             │   1 group → UnitaryKVCacheCoordinator (:419)
             │   >1 group → HybridKVCacheCoordinator (:506)
@@ -923,7 +934,7 @@ Beat6    #0[≈∗]  #1[≈∗]  #2[≈∗]  #3·     #4·     ···  KV 满 �
   `ref_cnt` 1→2（**⊕ 共享**）→ R2 的 token0-31 **免重算**，只算 token32-39 写进新 `#4`。
 - **Beat 5**（free）：`ref_cnt` 归零才进空闲；带 hash 的 `#2` 进 LRU 尾但**仍在哈希表**（≈，可再命中），
   半满的 `#3` 无 hash 直接 free。
-- **Beat 6**（抢占）：`allocate_slots` 返回 None → `_preempt_request`（`scheduler.py:1107`，
+- **Beat 6**（抢占）：`allocate_slots` 返回 None → `_preempt_request`（`scheduler.py:1140`，
   **recompute 无 swap**）→ free `#0,#1,#4`；R2 `num_computed_tokens=0` 回 waiting，重调度可再命中 `#0,#1`。
 
 ---
@@ -1263,7 +1274,7 @@ block 寻址：layer L（在 slot s、offset o_s、page_size ps_s）的 block b 
             │                     │
             └──────────┬──────────┘
                        ▼
-        KVCacheManager.allocate_slots   (kv_cache_manager.py:244)
+        KVCacheManager.allocate_slots   (kv_cache_manager.py:248)
           ① 算 token 总数
           ② watermark 门槛
           ③ full-sequence 准入 (WAITING)
@@ -1282,7 +1293,7 @@ block 寻址：layer L（在 slot s、offset o_s、page_size ps_s）的 block b 
             (spec: scheduled_spec_decode_tokens[req_id] = draft[:n])
                        │
                        ▼
-                  SchedulerOutput   (v1/core/sched/output.py:180)
+                  SchedulerOutput   (v1/core/sched/output.py:181)
 ```
 
 **prefix cache 命中与淘汰的生命周期**：
@@ -1305,7 +1316,7 @@ block 寻址：layer L（在 slot s、offset o_s、page_size ps_s）的 block b 
 
 ### 3.5 SchedulerOutput
 
-**文件**: `vllm/v1/core/sched/output.py:180`
+**文件**: `vllm/v1/core/sched/output.py:181`
 
 关键字段：
 
@@ -1373,7 +1384,7 @@ EngineCore.step()                                          core.py:479
                  └─ run_method(driver_worker, "execute_model", ...)   :98
                       └─ WorkerWrapperBase.execute_model    worker_base.py:346
                            └─ Worker.execute_model          gpu_worker.py:836
-                                └─ GPUModelRunner.execute_model(sched_out, intermediate_tensors)  gpu_model_runner.py:4056
+                                └─ GPUModelRunner.execute_model(sched_out, intermediate_tensors)  gpu_model_runner.py:4070
 ```
 
 `Worker.execute_model`（`gpu_worker.py:836`，`@torch.inference_mode`）先处理 PP 的
@@ -1382,10 +1393,10 @@ EngineCore.step()                                          core.py:479
 
 ### 4.2 GPUModelRunner.execute_model 骨架
 
-**文件**: `vllm/v1/worker/gpu_model_runner.py:4056`
+**文件**: `vllm/v1/worker/gpu_model_runner.py:4070`
 
 ```
-execute_model(scheduler_output, intermediate_tensors=None)        gpu_model_runner.py:4056
+execute_model(scheduler_output, intermediate_tensors=None)        gpu_model_runner.py:4070
   │  → ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None
   │
   ├─ 守卫：execute_model_state 必须为 None（上次 sample_tokens 已消费）   :4061-4065
@@ -1630,10 +1641,10 @@ image-pad）。`_merge_multimodal_embeddings`（`models/utils.py:500`）把这�
 
 ### 5.1 sample_tokens 全流程
 
-**文件**: `vllm/v1/worker/gpu_model_runner.py:4435`
+**文件**: `vllm/v1/worker/gpu_model_runner.py:4456`
 
 ```
-sample_tokens(grammar_output)                                 gpu_model_runner.py:4435
+sample_tokens(grammar_output)                                 gpu_model_runner.py:4456
   │  @torch.inference_mode
   │
   ├─ if execute_model_state is None:                          :4438-4446
@@ -1674,7 +1685,7 @@ sample_tokens(grammar_output)                                 gpu_model_runner.p
 被藏到 GPU forward 后面；等 `future.result()`（`:497`）回来，bitmask 已算好，`sample_tokens`
 直接拿来用。
 
-**生成**（`Scheduler.get_grammar_bitmask`，`scheduler.py:1440`）→
+**生成**（`Scheduler.get_grammar_bitmask`，`scheduler.py:1475`）→
 `StructuredOutputManager.grammar_bitmask`（`structured_output/__init__.py:204`）：
 
 ```
@@ -1763,7 +1774,7 @@ greedy 路径就是 `logits.argmax(dim=-1)`（`sampler.py:239`），纯 GPU 无�
 
 ### 5.5 _bookkeeping_sync：唯一的 GPU→CPU 同步
 
-**文件**: `gpu_model_runner.py:3613`
+**文件**: `gpu_model_runner.py:3627`
 
 ```
 _bookkeeping_sync(...)
@@ -1781,7 +1792,7 @@ _bookkeeping_sync(...)
   └─ [异步路径] 不在此同步，prev_sampled_token_ids 留 GPU，D2H 推迟到 AsyncGPUModelRunnerOutput.get_output
 ```
 
-**`_to_list`**（`gpu_model_runner.py:7504`）：把 `sampled_token_ids`（GPU int32）非阻塞拷进
+**`_to_list`**（`gpu_model_runner.py:7600`）：把 `sampled_token_ids`（GPU int32）非阻塞拷进
 pinned CPU buffer，在 copy stream 上记 `transfer_event`，`event.synchronize()`，再 `tolist()`。
 注释（`:7505-7512`）解释：这避免 `.tolist()` 触发的整 CUDA stream 同步（issue #22754）。
 
@@ -1793,7 +1804,7 @@ GPU op、返回 GPU tensor。sampled id 必须变 Python int 才能（a）更新
 
 ### 5.6 ModelRunnerOutput
 
-**文件**: `vllm/v1/outputs.py:233`
+**文件**: `vllm/v1/outputs.py:234`
 
 `ModelRunnerOutput`（跨进程序列化给 scheduler，故字段是 Python list 而非 tensor）：
 
@@ -1865,7 +1876,7 @@ draft token 计入 `num_tokens_with_spec`、走 `allocate_slots` 分配、走一
 
 ### 6.2 propose 阶段
 
-**文件**: `vllm/v1/worker/gpu_model_runner.py:4864`
+**文件**: `vllm/v1/worker/gpu_model_runner.py:4913`
 
 `sample_tokens` 末尾的闭包 `propose_draft_token_ids`（`:4493-4507`）按 proposer 类型决定在
 bookkeeping 前/后调用：
@@ -1891,7 +1902,7 @@ bookkeeping 前/后调用：
 
 返回后 `_copy_draft_token_ids_to_cpu`（`:4749`）异步 D2H 到 `self.draft_token_ids_cpu`。
 `post_step`（`core.py:510-517`，同步路径）经 `take_draft_token_ids()` 把 draft 拉回 EngineCore，
-`Scheduler.update_draft_token_ids`（`scheduler.py:1900`）写到 `request.spec_token_ids`（`:1920`）。
+`Scheduler.update_draft_token_ids`（`scheduler.py:1948`）写到 `request.spec_token_ids`（`:1920`）。
 
 ### 6.3 调度 draft token
 
@@ -1951,10 +1962,10 @@ target 的 argmax 值，等价于 draft 被接受），第 `num_accepted` 个是
 
 ### 6.6 update_from_output：接受计数与回滚
 
-**文件**: `vllm/v1/core/sched/scheduler.py:1464`
+**文件**: `vllm/v1/core/sched/scheduler.py:1499`
 
 ```
-update_from_output(scheduler_output, model_runner_output)        scheduler.py:1464
+update_from_output(scheduler_output, model_runner_output)        scheduler.py:1499
   └─ for req_id in scheduled_req_ids:                             :1527+
         generated_token_ids = sampled_token_ids[req_index]        :1544-1546
         scheduled_spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(req_id)  :1548
@@ -2033,7 +2044,7 @@ post_step()                            │
 ```
 
 **指标**：`SpecDecodingStats`（`v1/spec_decode/metrics.py:17`）每步由
-`Scheduler.make_spec_decoding_stats`（`scheduler.py:2266`）聚合 `num_drafts`/`num_draft_tokens`/
+`Scheduler.make_spec_decoding_stats`（`scheduler.py:2314`）聚合 `num_drafts`/`num_draft_tokens`/
 `num_accepted_tokens` 及逐位置接受率；Prometheus 计数器 `vllm:spec_decode_num_*`
 （`metrics.py:228-264`）。
 
@@ -2099,7 +2110,7 @@ EngineCoreProc          Scheduler          KVCacheManager        model_executor/
 Request (v1/request.py)                  num_computed_tokens, spec_token_ids, block_hashes
     │  (Scheduler 内部对象)
     ▼
-SchedulerOutput (v1/core/sched/output.py:180)
+SchedulerOutput (v1/core/sched/output.py:181)
     │  num_scheduled_tokens, scheduled_spec_decode_tokens, req_to_block_ids,
     │  num_spec_tokens_to_schedule
     │  ═══ model_executor (Future, 跨进程) ═══
@@ -2113,7 +2124,7 @@ Hidden States → Logits (GPU)             compute_logits(hidden[logits_indices]
 sample_tokens → sampled_token_ids (GPU)  apply_grammar_bitmask → Sampler/RejectionSampler
     │  _bookkeeping_sync → CPU list
     ▼
-ModelRunnerOutput (v1/outputs.py:233)    sampled_token_ids: list[list[int]], logprobs
+ModelRunnerOutput (v1/outputs.py:234)    sampled_token_ids: list[list[int]], logprobs
     │  (含接受的 draft + bonus)
     │  ═══ 回 EngineCore ═══
     ▼
@@ -2130,9 +2141,9 @@ EngineCoreOutput                         new_token_ids, finish_reason, scheduler
 
 | 决策 | 代码位置 | 体现 |
 |------|----------|------|
-| execute_model / sample_tokens 拆分 | `gpu_model_runner.py:4417` return None；`:4435` sample_tokens；`core.py:491-499` | grammar bitmask 藏在 GPU forward 后面 |
-| 采样全程 GPU，单一同步 | `sampler.py` 全 GPU op；`gpu_model_runner.py:3613` `_bookkeeping_sync`；`:7504` `_to_list` | 回避 `torch.multinomial`，用 Gumbel-max/FlashInfer |
-| spec decode 复用 token 记账 | `scheduler.py:390-399` num_tokens_with_spec；`:463-467` num_new_tokens；`:582-594` 切 draft；`:1564` 回滚 | chunked prefill/prefix cache/spec 同一套逻辑 |
+| execute_model / sample_tokens 拆分 | `gpu_model_runner.py:4438` return None；`:4435` sample_tokens；`core.py:491-499` | grammar bitmask 藏在 GPU forward 后面 |
+| 采样全程 GPU，单一同步 | `sampler.py` 全 GPU op；`gpu_model_runner.py:3627` `_bookkeeping_sync`；`:7504` `_to_list` | 回避 `torch.multinomial`，用 Gumbel-max/FlashInfer |
+| spec decode 复用 token 记账 | `scheduler.py:398-407` num_tokens_with_spec；`:463-467` num_new_tokens；`:582-594` 切 draft；`:1564` 回滚 | chunked prefill/prefix cache/spec 同一套逻辑 |
 
 ---
 
@@ -2144,16 +2155,16 @@ EngineCoreOutput                         new_token_ids, finish_reason, scheduler
    `:1300 _process_engine_step` → `:479 step`。建立“输入线程 / 主线程 / 输出线程”三线程模型。
 2. **socket 解耦**：`core.py:1484 process_input_sockets`、`:1589 process_output_sockets`，理解
    ZMQ IO 与调度循环如何解耦、ABORT 为何入两个队列。
-3. **schedule 主干**：`scheduler.py:388 schedule`，先读 `:390-399` 的记账注释，再读 RUNNING
+3. **schedule 主干**：`scheduler.py:396 schedule`，先读 `:390-399` 的记账注释，再读 RUNNING
    循环（`:430-623`）和 WAITING 循环（`:625-988`），最后看 SchedulerOutput 构建（`:1004-1075`）。
-4. **KV cache 三层**：`kv_cache_manager.py:244 allocate_slots`（十步）→
+4. **KV cache 三层**：`kv_cache_manager.py:248 allocate_slots`（十步）→
    `single_type_kv_cache_manager.py:101 get_num_blocks_to_allocate`（block 数怎么算）→
    `block_pool.py:542 get_new_blocks` / `:597 touch` / `:614 free_blocks`（LRU 与淘汰）→
    `kv_cache_utils.py:577 hash_block_tokens` / `:673 get_request_block_hasher`（prefix hash）。
 5. **抢占**：`scheduler.py:523-572` 抢占循环 → `:1107 _preempt_request`（recompute，无 swap）→
    `:2082 _free_request_blocks`（延迟 free）。
 6. **executor dispatch**：`abstract.py:221 execute_model` → `uniproc_executor.py:79 collective_rpc`
-   → `gpu_worker.py:835 execute_model` → `gpu_model_runner.py:4056 execute_model`。对比
+   → `gpu_worker.py:835 execute_model` → `gpu_model_runner.py:4070 execute_model`。对比
    `multiproc_executor.py:340 collective_rpc` 和 `:979 worker_busy_loop` 看跨进程。
 7. **execute_model 内部**：`:1127 _update_states` → `:1889 _prepare_inputs`（含 spec metadata
    `:2161`/`:2750`）→ `:2216 _build_attention_metadata` → `:3439 _preprocess` → `:3822
@@ -2163,12 +2174,12 @@ EngineCoreOutput                         new_token_ids, finish_reason, scheduler
    `sampler.py:72 forward` / `:371 apply_logits_processors` / `:243 sample` →
    `topk_topp_sampler.py:70 TopKTopPSampler`（Gumbel-max/FlashInfer）→ `:3613 _bookkeeping_sync` /
    `:7504 _to_list`。
-9. **spec decode**：`gpu_model_runner.py:4864 propose_draft_token_ids` → `llm_base_proposer.py:443
-   propose`（draft forward）→ `scheduler.py:1900 update_draft_token_ids`（写 spec_token_ids）→
+9. **spec decode**：`gpu_model_runner.py:4913 propose_draft_token_ids` → `llm_base_proposer.py:443
+   propose`（draft forward）→ `scheduler.py:1948 update_draft_token_ids`（写 spec_token_ids）→
    回 schedule（`:582-594` 切 draft）→ verify forward → `rejection_sampler.py:88 forward` /
    `:394 rejection_sample` / `:715` greedy kernel（find-first-mismatch + bonus）→
-   `scheduler.py:1464 update_from_output`（`:1556-1564` 接受计数与回滚）。
-10. **指标**：`scheduler.py:2266 make_spec_decoding_stats` → `v1/spec_decode/metrics.py:17 SpecDecodingStats`。
+   `scheduler.py:1499 update_from_output`（`:1556-1564` 接受计数与回滚）。
+10. **指标**：`scheduler.py:2314 make_spec_decoding_stats` → `v1/spec_decode/metrics.py:17 SpecDecodingStats`。
 
 > 一条记忆线索：**所有“特殊”机制（chunked prefill、prefix cache、spec decode、jump decoding）
 > 都不是独立分支，而是被 `num_tokens_with_spec` / `num_computed_tokens` 这套统一记账吸收进
