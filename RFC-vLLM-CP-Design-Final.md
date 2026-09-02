@@ -342,3 +342,123 @@ Same ops, same shapes, same order — `self.dcp_combine`/`self.dcp_world_size`/`
 
 ## 12. One-sentence position
 vLLM closes its CP gaps — PCP prefill, reusable recipes, layout-level metadata, MLA/sparse/linear/hybrid breadth, chunked-prefill merge, enabled/active — by adding `CPContext` + `CPBatchLayout` + `v1/attention/cp.py` recipes and porting vLLM-Ascend's *recipes* (zigzag prefill, DCP/PCP LSE-merge, MLA tail-proj, linear state propagation), while preserving main's boundaries (model-transparent, CP folded into normal backends, comms via `vllm.distributed`, numerics in `v1/attention/ops`) and adopting **none** of Ascend's fat `PCPManager`, per-type CP backends, or kernel-level metadata.
+
+---
+
+## Appendix: Implementation contracts from v4
+
+Contracts from the v4 draft that the main text leaves implicit. Naming note: v4's `CPPolicy`/`pcp_allgather_restore_idx`/`pcp_unpad_mask`/`max_tokens_across_pcp` are this document's `CPShardingPolicy`/`restore_idx`/`unpad_mask`/`max_num_tokens_across_pcp` (§4.2). Where v4 and this document disagree, this document wins.
+
+### A.1 Runner-side split contract
+
+The runner split is a pure layout builder; its second return value indexes into the full scheduled-token order:
+
+```python
+def build_pcp_layout_and_local_positions(
+    query_lens_full_cpu: torch.Tensor,
+    num_decodes: int,
+    cp_context: CPContext,
+    policy: CPPolicy,
+) -> tuple[CPBatchLayout, torch.Tensor]:
+```
+
+The returned `local_positions_cpu` selects this rank's tokens:
+
+```python
+input_ids_local = input_ids_full[local_positions_cpu]
+positions_local = positions_full[local_positions_cpu]
+query_lens_local = layout.query_lens_local_cpu
+query_start_loc_local = layout.query_start_loc_local_cpu
+```
+
+Decode tokens are not zigzag-split in the first implementation.
+
+### A.2 PCP slot-mapping and KV-cache-update contract
+
+PCP-active prefill creates local K/V before attention, but cache update must see K/V in the same logical order as slot mapping. Two helpers enforce that:
+
+```python
+pcp_all_gather_restore(x, layout, group, dim=0, unpad=True)
+```
+
+1. pad local tensor to `layout.max_tokens_across_pcp`
+2. all-gather across PCP
+3. restore with `layout.pcp_allgather_restore_idx`
+4. optionally unpad with `layout.pcp_unpad_mask`
+
+```python
+build_pcp_padded_slot_mapping(slot_mapping, layout)
+```
+
+- fill padded entries with `PAD_SLOT_ID` / `-1`
+- place real slot mappings at restored positions
+- return the shape expected by cache update
+
+Cache update then calls the existing `reshape_and_cache_flash` with the restored full current K/V. The ownership invariant is unchanged — no second KV ownership model for PCP:
+
+```text
+logical sequence is full
+physical KV cache is CP-sharded by total_cp_rank
+slot_mapping decides which tokens this rank stores
+```
+
+`BlockTable.compute_slot_mapping` (`vllm/v1/worker/block_table.py`) already shards physical slots by `TOTAL_CP_WORLD_SIZE = pcp_world_size * dcp_world_size`, `TOTAL_CP_RANK = pcp_rank * dcp_world_size + dcp_rank`, `CP_KV_CACHE_INTERLEAVE_SIZE = cp_kv_cache_interleave_size`; PCP builds on that, not beside it.
+
+### A.3 Logits
+
+Initial implementation takes the simple correct path: restore hidden states across PCP before logits (via `pcp_all_gather_restore`), then reuse the existing logits code unchanged. Per-rank local-logits optimization is explicitly deferred to a later PR.
+
+### A.4 Enabled/active fallback rule
+
+§4.2's `active = cp_enabled and policy_applies(batch)` has one concrete initial rule — a per-request check over the whole batch:
+
+```python
+can_pcp_split = all(
+    query_len >= 2 * pcp_size
+    for each prefill request
+)
+```
+
+If false for any request: `pcp_enabled=True`, `pcp_active=False`, local input remains unsplit, metadata remains normal, the backend runs normal prefill. This avoids crashes for short prompts, prefix-cache hits, decode-only batches, and unsupported shapes.
+
+### A.5 Chunked-prefill local lengths and staged rollout
+
+Generalize DCP local context lengths to a per-CP-rank tensor:
+
+```python
+cp_local_seq_lens_cpu: [num_reqs, pcp_size, dcp_size]
+```
+
+Metadata builders derive from it: local context starts, local chunk lengths, padded local chunk lengths, chunk restore indices, and the context output LSE merge plan. Rollout in three stages:
+
+- **Stage 1**: disable PCP for chunked context; fall back cleanly.
+- **Stage 2**: current prefill chunk uses Partial Q + Full current KV; historical context remains DCP-only.
+- **Stage 3**: full PCP+DCP chunked context with LSE merge (§4.8).
+
+### A.6 Structured backend capabilities (deferred alternative)
+
+v4 proposed replacing the boolean `supports_pcp` with a structured declaration, since backends differ along more axes than one bit (full-KV prefill, partial-KV LSE, DCP decode, zigzag, contiguous layout, sparse global indexer, hybrid enter/exit):
+
+```python
+@dataclass(frozen=True)
+class PCPBackendSupport:
+    full_kv_prefill: bool = False
+    partial_kv_prefill_lse: bool = False
+    decode_dcp: bool = False
+    zigzag: bool = False
+    contiguous: bool = False
+    round_robin: bool = False
+    sparse_global_indexer: bool = False
+    hybrid_enter_exit: bool = False
+```
+
+consumed by policy-aware validation:
+
+```python
+if layout.policy == CPPolicy.ZIGZAG:
+    assert impl.pcp_support.zigzag
+if layout.requires_full_kv_prefill:
+    assert impl.pcp_support.full_kv_prefill
+```
+
+This design deliberately keeps the boolean cap flags as class attributes (§4.1). `PCPBackendSupport` is recorded here as the explicitly deferred alternative, not as part of the plan.

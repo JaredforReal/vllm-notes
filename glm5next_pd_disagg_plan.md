@@ -194,3 +194,13 @@ vllm serve <model> \
 2. **float32 recurrent state**: recurrent_state 是 float32，conv states 是 model dtype
 3. **DS layout 强制**: 必须 `VLLM_SSM_CONV_STATE_LAYOUT=DS`
 4. **Block 不裁剪**: KDA blocks 代表完整 state，partial prefix hit 时不能裁剪
+
+## 部署注意事项
+
+### RDMA 不通时 UCX 自动回退 TCP
+
+如果 RDMA 测试失败（跨节点 NIC 不在同一 L2），NIXL 可以走 **UCX TCP fallback**。性能会差一些，但功能正常。对应配置为 `--kv-transfer-config` 中的 `kv_connector_extra_config: {"backends": ["UCX"]}` — UCX 作为 NIXL 后端，同时支持 RDMA 和 TCP fallback。
+
+### Decode 开 MTP 时 P/D 两端 speculative config 必须一致
+
+Decode 端开 MTP 时，Prefill 节点不需要 `--speculative-config`。但两端 `num_spec` 的差异可能导致 KDA conv_state 形状不匹配。如果遇到 compatibility hash 问题，两端都需要配置相同的 speculative config（Prefill 端加上但不实际使用 MTP）。

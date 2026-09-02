@@ -173,7 +173,7 @@ graph 捕获时把 `pcp_rank/dcp_rank/dcp_size` 存进参数（行 659-662），
 
 ## 5. Chunked prefill：AllGatherQ 路径
 
-GQA 后端对 chunked prefill 用 **AllGatherQ**（与 decode 流程一致），而不是 MLA 的 AllGatherKV。详见 `vllm-ascend-chucked-prefill-PCP.md` 第 2 节。要点：
+GQA 后端对 chunked prefill 用 **AllGatherQ**（与 decode 流程一致），而不是 MLA 的 AllGatherKV。详见 `vllm-ascend-chunked-prefill-PCP.md` 第 2 节。要点：
 
 - `_prefill_query_all_gather`（行 716）：PCP allgather Q + `cp_kv_recover_idx_for_chunk` 还原 + DCP allgather Q(head)；
 - 多流 overlap：`cp_chunkedprefill_comm_stream()` 把 allgather Q / a2a-ag output 与本地 head/tail attention overlap（行 978-982 的流程图）；

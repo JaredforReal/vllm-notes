@@ -233,7 +233,7 @@ MLA（DSV2/V3、Kimi-K25）结构不同（压缩 kv_c + k_pe），但三场景�
 
 > MLA 的 chunked prefill 用 AllGatherKV（而非 GQA 的 AllGatherQ）的原因：MLA 的压缩 KV 很小，gather 完整 kv_c 比 gather Q 更省通信量。
 
-DSA / SFA 后端的切分与通信又不同（DSA 走 TP 域线性切片，SFA 走 compact block gather），见 `vllm-ascend-PCP-DSA.md` / `vllm-ascend-chucked-prefill-PCP.md`。
+DSA / SFA 后端的切分与通信又不同（DSA 走 TP 域线性切片，SFA 走 compact block gather），见 `vllm-ascend-PCP-DSA.md` / `vllm-ascend-chunked-prefill-PCP.md`。
 
 ---
 

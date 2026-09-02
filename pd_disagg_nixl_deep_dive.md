@@ -505,7 +505,7 @@ if block_size_ratio != 1:
 | **host-buffer + block_size_ratio** | `assert not self.use_host_buffer` | ratio 机制全挂在「设备侧 descriptor + RDMA 直传」路径上；host-buffer 走 `copy_blocks` 按**整 block** h2d，不保留 sub-block 粒度，补零逻辑失去前提。host buffer 还是 per-layer 的，破坏 HMA 共享 region 的去重（§6）。需平行重写一套，本 PR 未做。 |
 | **head-sharded attention + block_size_ratio + P_TP>D_TP** | `assert block_size_ratio==1 or fa_num_splits==1 or all(fa_desc_replicated)` | 三个轴（token 切 / head 切 / per-source 切）同时在同一个平坦 `(addr,len)` 字节区间上做切分。`addr + fa_slot*chunk` 的 head 偏移数学只在 `local_len`=完整 block 时验证过；叠加 sub-block 后既未推导也未测试。MLA（replicated）落进 `all(fa_desc_replicated)` 安然通过；目标负载（Kimi/DeepSeek/GLM）不受影响。 |
 
-**为什么挡掉是对的**：KV 传输写错字节不会立刻崩，而是让**无关请求** decode 到一半吐 garbage —— 最难查的 bug。两条 assert 把「算不出正确几何」的组合变成握手期硬错 + 可读 message，比悄悄发错强。详见 [对话分析](../learning_doc) 中对该 PR 的逐条拆解。
+**为什么挡掉是对的**：KV 传输写错字节不会立刻崩，而是让**无关请求** decode 到一半吐 garbage —— 最难查的 bug。两条 assert 把「算不出正确几何」的组合变成握手期硬错 + 可读 message，比悄悄发错强。
 
 ---
 

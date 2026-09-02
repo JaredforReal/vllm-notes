@@ -1,92 +1,138 @@
-# PCP and DCP in vLLM-Ascend
+# DCP（Decode Context Parallel）与 PCP 的协作
 
-本文解释 vLLM-Ascend 中 PCP 与 DCP 的关系。核心结论：Ascend 不是简单把 PCP 当作 DCP 的别名，而是在 current prefill chunk、decode、chunked context 中分别使用不同的数据分布和合并方式。
+> 对应原始问题（来自 intro 衍生）：*DCP 是什么？它如何与 PCP 叠加？通信域如何复用？*
+>
+> 设计文档：`vllm-ascend/docs/source/developer_guide/Design_Documents/context_parallel.md` §“Decode Context Parallel (DCP)”。
 
-## 术语
+## 1. DCP 的定位
 
-- PCP: Prefill Context Parallelism，主要切 prefill query。
-- DCP: Decode Context Parallelism，主要切 decode/context KV。
-- Mode 1: partial Q + full KV，不需要跨 rank softmax 合并。
-- Mode 2: partial Q + partial KV，需要 out+LSE 合并。
+DCP（Decode Context Parallel）**复用 TP 通信域**，不额外占卡。它的目的是：在 decode 阶段，把原本在 TP 组内 **冗余存储** 的 KV cache 沿序列维度再分片一份，腾出显存装更多 KV cache → 更大 batch → 更高吞吐。
 
-## Ascend 的 PCP+DCP Metadata
+- 开关：`--decode-context-parallel-size`（`decode_context_parallel_size`）；
+- 不增加 world size（不像 PCP）；
+- 主要影响 **decode**、**chunked prefill**、**cached prefill** 的逻辑。
 
-`PCPManager.generate_pcp_metadata()` 会计算：
+### 与 PCP 的统一关系
 
-```text
-num_computed_tokens_of_pcp_dcp[req, pcp_rank, dcp_rank]
+```
+cp_size = pcp_size * dcp_size
+cp_rank = pcp_rank * dcp_size + dcp_rank
 ```
 
-它表示每个 request 的历史/context token 在 PCP+DCP 网格上的 local KV 长度。计算时还考虑 `cp_kv_cache_interleave_size`。
+PCP 和 DCP 共享同一套 KV cache 分片布局（见下节 block table），二者可单独或组合开启。组合时通信顺序为：**先 DCP 组 all-to-all（head 维），再 PCP 组 all-gather（seq 维）**。
 
-这个字段被 decode 和 chunked context path 用来告诉 attention kernel 当前 rank 能看到多少 KV。
+## 2. KV cache 分片布局（PCP/DCP 共用）
 
-## Decode Path: Mode 2
+**源码：`vllm_ascend/worker/block_table.py:170` `compute_slot_mapping`**
 
-Decode path 不是 full-KV current chunk，而是明显的 Mode 2。
+```python
+virtual_block_size = block_size * dcp_world_size * pcp_world_size   # “虚拟块”
 
-流程：
+logical_block_idx = positions // virtual_block_size
+block_table_indices = req_indices * max_num_blocks_per_req * blocks_per_phys_block + logical_block_idx
+block_numbers = block_table[...]                                    # 物理块号
 
-1. 每个 PCP/DCP rank 根据 `num_computed_tokens_of_pcp_dcp` 读取本地 KV shard。
-2. attention kernel 计算局部 `attn_output` 和 `softmax_lse`。
-3. `_process_attn_out_lse()` 把 output 和 LSE 拼在一起：
-   - DCP 维度做 `all_to_all_single`
-   - PCP 维度做 `all_gather`
-4. `_npu_attention_update()` 把所有 rank 的局部 softmax 结果用 LSE 合并成全局结果。
+virtual_block_offsets = positions % virtual_block_size
+current_rank = dcp_world_size * pcp_rank + dcp_rank
+# 判断该 token 归哪个 rank（按 interleave 粒度）
+mask = (virtual_block_offsets // cp_kv_cache_interleave_size
+        % (dcp_world_size * pcp_world_size)) == current_rank
 
-这和 vLLM DCP 的核心思想一致：KV 可以分片，但必须有 LSE 才能正确合并。
+block_offsets = (virtual_block_offsets
+                 // (cp_world * cp_kv_cache_interleave_size) * cp_kv_cache_interleave_size
+                 + virtual_block_offsets % cp_kv_cache_interleave_size)
+slot_mapping = block_numbers * block_size + block_offsets
+# 只有落在本 rank 的 token 写真实 slot，其余填 -1
+slot_mapping = where(mask, slot_mapping, -1)
+```
 
-## Current Prefill Chunk: Mostly Mode 1
+要点：
+- 定义 **虚拟块** = `block_size * cp_size`；同一虚拟块里的 token 按 `cp_kv_cache_interleave_size`（默认 1，token 粒度交错）轮流分给各 rank；
+- 每个 rank 只对自己负责的那些 token 写真实 slot，其他为 `-1`；
+- 约束：`block_size % cp_kv_cache_interleave_size == 0`；
+- KV 搬运场景（PD disagg / KV pool）必须 `cp_kv_cache_interleave_size = block_size`（128），否则传输对齐出错。
 
-对当前正在处理的 prefill chunk，Ascend 经常把 KV all-gather 回全量，然后再让本 rank 的 Q 做 attention。
+## 3. DCP 的通信方式（按后端）
 
-普通 attention 的 `reshape_and_cache()` 中：
+### 3.1 MLA 后端（`mla_cp.py`）
 
-- 非 hybrid attention: gather current prefill K/V across PCP ranks。
-- 用 `pcp_allgather_restore_idx` 恢复原始顺序。
-- 之后 cache 的是恢复顺序后的 full current chunk KV。
+**Decode**（`_forward_decode`, `mla_cp.py:613`）：
+1. `reorg_decode_q`：DCP>1 时把 `cat([q_nope, q_pe])` 在 **head 维** allgather，使 DCP 组内 Q head 一致（行 493）；
+2. `num_heads = num_heads * dcp_size`；
+3. 本地 KV cache（已分片）做 attention，`actual_seq_lengths_kv = decode_meta.cp_seq_len`（本 rank 本地长度）；
+4. `_process_attn_out_lse`（`common_cp.py:108`）：
+   - DCP>1：head 维 **all_to_all_single**（交换 out/lse）；
+   - PCP>1：seq 维 **all_gather**；
+5. `_npu_attention_update` 合并（online softmax）。
 
-MLA 的 `mla_preprocess_prefill()` 中：
+**Chunked Prefill**（`_reorg_kvcache`, `mla_cp.py:767`）：
+- `get_dcp_group().all_gather(kv_c_k_pe, 0)` 把 context 的压缩 KV 在 DCP 组 gather 完整；
+- 再 PCP gather；
+- 按 `(rank, request, chunk)` 整理成连续布局（见 chunked-prefill 笔记第 3 节例子）。
 
-- gather `prefill_kv_c_k_pe` across PCP ranks。
-- restore 顺序。
-- 再 reshape/cache latent KV。
+### 3.2 GQA 后端（`attention_cp.py`）
 
-所以 current prefill chunk 更接近 Mode 1。
+**Decode**（`_forward_decode_pcp_dcp`, 行 566）：
+1. `query = get_dcp_group().all_gather(query, 1)`（head 维）；
+2. `num_heads = num_heads * dcp_size`；
+3. 本地 KV attention，`actual_seq_lengths_kv = num_computed_tokens_of_pcp_dcp[:, pcp_rank, dcp_rank]`；
+4. `_process_attn_out_lse`（DCP all2all + PCP ag）→ `_npu_attention_update`。
 
-## Chunked Prefill Context: Mode 2
+设计文档对 GQA chunked prefill / decode 的描述：
+> “GQA 后端先对 Q 做 head 维 allgather 保证 DCP 组内一致，本地算完后用 `cp_lse_ag_out_rs` 风格聚合 out/lse 并 reduce-scatter；也可用 all-to-all 交换 out/lse 后本地 update（与 PCP 兼容的写法一致）。”
 
-Chunked prefill 有两部分 KV：
+### 3.3 DSA / SFA 后端
 
-- current chunk KV: 当前正在算的 token，可 all-gather 成 full KV。
-- context/prefix KV: 之前 chunk 或 cache hit 的历史 KV，分布在 PCP/DCP shards 上。
+- DSA：CP 复用 TP 域的线性切片，output 还原走 TP all_to_all（见 DSA 笔记第 4 节）；
+- SFA：`gather_kv_cross_cp` 里 `dcp_size>1` 先 `get_dcp_group().all_gather(req_kv_cache, 0)`，再 pcp gather（`sfa_cp.py:380`）。
 
-Ascend 对 context 部分走 Mode 2：
+## 4. `num_computed_tokens_of_pcp_dcp`：DCP 的核心 metadata
 
-1. `_prefill_query_all_gather()` 先收集 full query。
-2. `_compute_prefill_context()` 用本地 context KV shard 计算局部 context attention。
-3. `_gather_global_context_output()` 跨 DCP/PCP 收集 out+LSE。
-4. `_update_global_context_output()` 用 LSE 合并。
-5. `_update_chunk_attn_out_lse_with_current_attn_out_lse()` 把 context output 和 current chunk output 再合并。
+每个 req 在每个 CP rank 上的 **本地 KV 长度**，shape `[num_reqs, pcp_size, dcp_size]`，由 `PCPManager._get_cp_local_seq_lens`（`pcp_utils.py:1042`）算：
 
-这说明 chunked prefill 是 PCP/DCP 最复杂的场景：同一个 request 内，current chunk 和 context KV 可以走不同模式。
+```python
+total_world_size = pcp_world_size * dcp_world_size
+base = seq_lens // cp_kv_cache_interleave_size // total_world_size * cp_kv_cache_interleave_size
+remainder = clip(seq_lens - base*total_world_size - rank_offsets*cp_kv_cache_interleave_size,
+                 0, cp_kv_cache_interleave_size)
+dcp_local_seq_lens = (base + remainder).reshape([-1, pcp_world_size, dcp_world_size])
+```
 
-## 对 vLLM Core 的启发
+即把 context_len 按 interleave 粒度尽量均分到各 rank，余数按 rank 顺序分配。decode 时各 rank 用 `[:, pcp_rank, dcp_rank]` 取自己的本地长度。
 
-建议 RFC 明确分阶段：
+`generate_pcp_metadata`（`pcp_utils.py:1098`）计算并存进 `AscendPrefillContextParallelMetadata.num_computed_tokens_of_pcp_dcp`，再传到 `AscendMetadataForDecode`（`common_cp.py:103`）。
 
-1. 先支持 Mode 1 current prefill chunk。
-2. 复用 DCP out+LSE merge 设计支持 decode/context Mode 2。
-3. 在 metadata 中显式区分：
-   - current query local lens
-   - current chunk full/restore indices
-   - context KV local lens per PCP/DCP rank
-   - output LSE merge requirements
-4. 不要把 `pcp_size > 1` 等价为“所有 attention 都需要 CP kernel”。
+## 5. 约束（用户指南 §Constraints）
 
-## Source Map
+- MLA 模型：`tp_size >= dcp_size` 且 `tp_size % dcp_size == 0`；
+- GQA 模型：`(tp_size // num_kv_heads) >= dcp_size` 且 `(tp_size // num_kv_heads) % dcp_size == 0`；
+- KV 搬运场景：`cp_kv_cache_interleave_size = block_size`。
 
-- `vllm_ascend/worker/pcp_utils.py`: `generate_pcp_metadata`, `_get_cp_local_seq_lens`
-- `vllm_ascend/attention/context_parallel/common_cp.py`: `_process_attn_out_lse`, `_npu_attention_update`
-- `vllm_ascend/attention/context_parallel/attention_cp.py`: `_compute_prefill_context`, `_gather_global_context_output`
-- `vllm_ascend/attention/context_parallel/mla_cp.py`: MLA decode/current prefill paths
+原因：DCP 复用 TP 域，KV head 在 TP 内分摊，DCP 子组必须能从 TP head 里干净切出来。
+
+## 6. MTP / spec decode 下的 DCP
+
+`generate_mtp_attention_mask_for_decode`（`pcp_utils.py:1371`）：spec decode 时 decode request 有多个 token（history + MTP），需要按 `(history_len + mtp_idx) % cp_size` 把 MTP token 分配到各 rank，并为每个 rank 生成 attention mask（`dcp_mtp_attn_mask`，shape `[num_decode_reqs, decode_threshold, max_model_len]`）。注释里有完整例子（行 1387-1401）。
+
+slot_mapping 在 MTP 下也要做 varlen compact（`sfa_cp.py:61 _compact_varlen_decode_slot_mapping`），因为同 batch 的 decode request 可能 query 长度不同。
+
+## 7. 通信域拓扑（PCP2, DCP2, TP4 示意）
+
+```
+8 张卡，TP4 + DCP2 + PCP2：
+- TP4: 卡 0-3 一组（DCP 复用）
+- DCP2: TP 组内再分 2（KV seq 分片）
+- PCP2: 跨两个 TP 组（卡 0-3 与 4-7），独立通信域
+
+decode 一次 attention 的通信：
+  本地 KV attn → DCP 组 all2all(head) → PCP 组 allgather(seq) → update
+```
+
+## 8. 小结
+
+- **DCP = 复用 TP 域的 KV seq 分片**，省冗余 KV、提吞吐；不增卡；
+- 与 PCP 共享 `cp_size = pcp*dcp` 模型与 block-table 分片布局；
+- 通信：head 维 allgather Q → 本地 KV attn → out/lse **DCP all2all + PCP allgather** → online-softmax 合并；
+- `num_computed_tokens_of_pcp_dcp` 是连接调度器与各 rank 本地 KV 长度的桥梁。
+
+对 RFC 的启示：DCP 是一个 **低成本、高收益的 TP 域内优化**，与 PCP 正交。上游 CP RFC 应把 PCP/DCP 设计为可独立开启、共享同一分片布局与 out/lse 合并原语的两个特性，而不是耦合在一起。

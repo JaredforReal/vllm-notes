@@ -61,6 +61,7 @@
 6. [同一闭环的变体：spec decode](#6-同一闭环的变体spec-decode)
 7. [回查：完整时序与数据对象流转](#7-回查完整时序与数据对象流转)
 8. [回查：代码阅读顺序](#8-回查代码阅读顺序)
+9. [调试指南](#9-调试指南)
 
 ---
 
@@ -2048,6 +2049,78 @@ post_step()                            │
 `num_accepted_tokens` 及逐位置接受率；Prometheus 计数器 `vllm:spec_decode_num_*`
 （`metrics.py:228-264`）。
 
+### 6.9 MTP predictor 内部结构
+
+6.7 表中的 mtp 系列 drafter 复用 target model 最后一层的 `hidden_states` 作为
+`previous_hidden_states`，每层 MTP predictor 的内部结构：
+
+```
+Target Model (主模型)
+  │
+  ├─ Layer 0 ~ Layer N-1: 正常 decoder layers
+  │     生成 hidden_states
+  │
+  └─ 输出: hidden_states (最后一个 token)
+
+MTP Predictor
+  │
+  ├─ embed_input_ids(input_ids) → inputs_embeds
+  │
+  ├─ inputs_embeds = enorm(inputs_embeds)
+  │   previous_hidden = hnorm(previous_hidden_states)
+  │   hidden = eh_proj(cat(inputs_embeds, previous_hidden))
+  │
+  ├─ MTP Block (KDA + MoE):
+  │   hidden = mtp_block(positions, hidden)
+  │
+  └─ shared_head.norm(hidden) → logits (或 hidden_states 给下一层)
+
+  如果有多个 MTP 层 (num_nextn_predict_layers > 1):
+    每层独立预测下一个 token
+    第 i 层的输出作为第 i+1 层的 previous_hidden_states
+```
+
+即 `inputs_embeds` 与 `previous_hidden_states` 各自先过 LayerNorm（`enorm` / `hnorm`），
+concat 后经 `eh_proj` 投影，再进 MTP Block；`num_nextn_predict_layers > 1` 时逐层串联预测，
+第 i 层的输出作为第 i+1 层的 `previous_hidden_states`，每层独立预测下一个 token。
+
+### 6.10 spec decode × KV connector：defer_finalize
+
+当 speculative decoding 和 PD 分离同时使用时，`execute_model()` 把 KV connector 的
+`wait_for_save()` 推迟到 `sample_tokens()` 里的 `finalize_kv_connector()`——因为 draft model
+的 forward 也要写 KV cache，必须等它写完再统一等待保存完成：
+
+```
+execute_model():
+  │
+  ├─ defer_kv_connector_finalize = True  ← 因为有 spec decode
+  │
+  └─ with maybe_get_kv_connector_output(..., defer_finalize=True):
+        │
+        ├─ start_load_kv()      ← 开始异步加载 KV
+        ├─ model forward        ← 主模型前向
+        │   └─ per-layer: wait_for_layer_load() / save_kv_layer()
+        │
+        └─ [不调用 wait_for_save()，因为 defer_finalize=True]
+
+sample_tokens():
+  │
+  ├─ _sample() → sampled tokens
+  ├─ propose_draft_token_ids() → draft tokens
+  │     └─ 如果 drafter 是 draft model:
+  │           draft_model.forward() ← draft model 也需要 KV cache
+  │
+  └─ finalize_kv_connector()
+        └─ wait_for_save()       ← 现在才等待保存完成
+            (draft model 的 KV 也一起保存)
+```
+
+对照无 spec decode 的路径：`maybe_get_kv_connector_output`（context manager，
+`vllm/v1/worker/kv_connector_model_runner_mixin.py`）进入时 `bind_connector_metadata()` +
+`start_load_kv()`，退出时若 `defer_finalize=False` 则直接 `wait_for_save()`；
+`defer_finalize=True` 时退出只做 `get_finished_sending()` / `get_finished_recving()` /
+`clear_connector_metadata()`，`wait_for_save()` 留给 `finalize_kv_connector()`。
+
 ---
 
 ## 7. 回查：完整时序与数据对象流转
@@ -2185,3 +2258,47 @@ EngineCoreOutput                         new_token_ids, finish_reason, scheduler
 > 都不是独立分支，而是被 `num_tokens_with_spec` / `num_computed_tokens` 这套统一记账吸收进
 > 同一个 `schedule → allocate_slots → execute_model → sample → update_from_output` 循环**。
 > 抓住这条主线和三个设计决策，其余都是在这条主线上挂的分支。
+
+---
+
+## 9. 调试指南
+
+### 9.1 定位问题的入口
+
+| 问题类型 | 入口 |
+|---------|------|
+| 调度问题 (请求不被调度, 预算不足) | `scheduler.schedule()` 加断点 |
+| KV cache 分配失败 | `kv_cache_manager.allocate_slots()` |
+| 模型前向传播错误 | `_model_forward()` → `self.model()` |
+| Attention 计算/shape 错误 | 各 layer 的 `forward()` |
+| Spec decode 验证错误 | `rejection_sampler.forward()` |
+| Draft token 提交错误 | `propose_draft_token_ids()` |
+| KV 传输问题 | `wait_for_layer_load()` / `save_kv_layer()` |
+| PD 分离 KV 不匹配 | `connector.build_connector_meta()` |
+| CUDA Graph 兼容性 | `_determine_batch_execution_and_padding()` |
+
+### 9.2 关键日志点
+
+- `scheduler.schedule()` 会打印 token budget 使用情况
+- `execute_model()` 会打印 batch size, padding, CUDA graph 模式
+- `@maybe_transfer_kv_layer` 装饰器在启用 KV transfer 时会打印层名
+- Spec decode rejection 比例在 `update_from_output()` 中统计
+
+### 9.3 常见调试场景
+
+**场景: Spec decode rejection rate 过高**
+1. 检查 `propose_draft_token_ids()` 的输出是否合理
+2. 检查 target model logits 与 draft model logits 的分布差异
+3. 在 `rejection_sampler.forward()` 中检查逐 token 的接受概率
+
+**场景: PD 分离 KV 传输失败**
+1. 检查 P/D 两端的 `NIXL_CONNECTOR_VERSION` 是否一致
+2. 检查 compatibility hash 是否匹配
+3. 在 `wait_for_layer_load()` 中检查是否超时
+4. 检查 block IDs 是否正确映射
+
+**场景: Hybrid 模型 (含 Mamba/KDA) 的 KV 传输问题**
+1. 确认 `VLLM_SSM_CONV_STATE_LAYOUT=DS`
+2. 确认 `--no-disable-hybrid-kv-cache-manager` 已设置
+3. 检查 MambaSpec 的 shapes 是否 P/D 两端一致
+4. 在 `_build_mamba_local()` / `_build_mamba_remote()` 中检查 descriptor 注册

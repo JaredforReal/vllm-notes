@@ -1679,7 +1679,7 @@ sequenceDiagram
   <div class="callout"><strong>一条记忆线索</strong>：所有"特殊"机制（chunked prefill、prefix cache、spec decode、jump decoding）都不是独立分支，而是被 <code>num_tokens_with_spec</code> / <code>num_computed_tokens</code> 这套统一记账吸收进同一个 <code>schedule → allocate_slots → execute_model → sample → update_from_output</code> 循环。抓住这条主线和三个设计决策，其余都是分支。</div>
 
   <div class="file-ref" style="margin-top:32px">
-    核对基准：vLLM tag <span class="path">v0.25.1</span> (commit 752a3a504) &nbsp;|&nbsp; 配套 markdown：<span class="path">learning_doc/execution-core.md</span> &nbsp;|&nbsp; 风格参考：<span class="path">vllm-request-journey.html</span>
+    核对基准：vLLM tag <span class="path">v0.25.1</span> (commit 752a3a504) &nbsp;|&nbsp; 配套 markdown：<span class="path">execution-core.md</span> &nbsp;|&nbsp; 风格参考：<span class="path">vllm-request-journey.html</span>
   </div>
 </section>
 
